@@ -1,4 +1,5 @@
-# Locked once the app scaffold is merged; placeholders for PlasmaColorizer
+# Optional quick install without pyproject: pip install -r requirements.txt
+# Recommended: pip install -e ".[dev]" (see pyproject.toml)
 PyQt6>=6.6
 materialyoucolor>=3.0
 dbus-python>=1.3.2

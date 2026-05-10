@@ -1,49 +1,57 @@
 # PlasmaColorizer
 
-PyQt6 helper for Manjaro KDE that reads the current Plasma wallpaper via DBus, derives colors with **materialyoucolor**, generates a Plasma color scheme (optional green-accent bias), and includes a tab for **Conky** configs with simple color templating.
+PyQt6 utility for **KDE Plasma** (Manjaro-friendly) that:
 
-Details and full implementation will land in subsequent commits.
+- Reads the active wallpaper via **`org.kde.PlasmaShell`** (DBus).
+- Extracts a seed color with **materialyoucolor** and builds a Material You–style palette.
+- Writes `~/.local/share/color-schemes/PlasmaColorizer.colors` and applies it with **`plasma-apply-colorscheme`**.
+- Optional **green accent bias** (shifts the seed hue toward green before scheme generation).
+- Offers a **Conky** tab to render config templates with `{{token}}` placeholders filled from the last generated palette.
 
-## Requirements (planned)
+## Requirements
 
 - Python 3.10+
-- Plasma 5/6 desktop session (`org.kde.PlasmaShell` on DBus, `plasma-apply-colorscheme` on `$PATH`)
+- Plasma session with `org.kde.PlasmaShell` and `plasma-apply-colorscheme` available.
+- `python-dbus` / **dbus-python** (see `pyproject.toml`).
 
-## Local setup
+## Install (editable, recommended)
 
 ```bash
 cd ~/Projects/PlasmaColorizer
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
 
-(Run step will be wired once `app.py` exists.)
-
-## Connect this folder to GitHub and push
-
-1. **Install GitHub CLI** (Arch/Manjaro): `sudo pacman -S github-cli`
-2. **Log in**: `gh auth login` → GitHub.com → HTTPS → authenticate in the browser
-3. **Wire git to gh**: `gh auth setup-git`
-4. **Create the remote repo from this clone and push**:
+Run the UI:
 
 ```bash
-cd ~/Projects/PlasmaColorizer
+plasmacolorizer
+# or
+python -m plasmacolorizer
+```
+
+## Usage notes
+
+- **Wallpaper detection** works best with the standard **Image** wallpaper plugin (`org.kde.image`). Other plugins may not expose a file path; use the “Override” field to point at an image.
+- **Dark / light** for generated Material schemes: choose *Follow KDE* (reads `ColorScheme` in `~/.config/kdeglobals`), or force dark/light.
+- **Conky tab** fills tokens such as `{{primary}}`, `{{on_surface}}`, `{{surface}}`, etc., after you successfully generate a palette on the Colorizer tab.
+
+## Tests
+
+```bash
+pytest
+```
+
+## GitHub
+
+```bash
 gh repo create PlasmaColorizer --public --source=. --remote=origin --push
 ```
 
-Use `--private` instead of `--public` if you want a private repository.
+(Use `--private` for a private repository.)
 
-Already created an empty repo on GitHub manually? Skip `gh repo create` and:
-
-```bash
-git remote add origin https://github.com/<your-username>/PlasmaColorizer.git
-git push -u origin main
-```
-
-## Permissions note
-
-If this directory was created by another tool and shows `root:root` ownership, fix it before pushing:
+If the project directory ever has wrong ownership from automation:
 
 ```bash
 sudo chown -R "$(whoami)":"$(whoami)" ~/Projects/PlasmaColorizer
