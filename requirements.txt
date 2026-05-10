@@ -1,0 +1,4 @@
+# Locked once the app scaffold is merged; placeholders for PlasmaColorizer
+PyQt6>=6.6
+materialyoucolor>=3.0
+dbus-python>=1.3.2
