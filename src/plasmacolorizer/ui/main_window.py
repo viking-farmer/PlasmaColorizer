@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -26,8 +27,9 @@ from PyQt6.QtWidgets import (
 )
 
 from plasmacolorizer.conky.templating import context_from_palette, render_template
+from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
-from plasmacolorizer.core.palette import MaterialPalette
+from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
 from plasmacolorizer.workers import GenerateSchemeWorker
 
 
@@ -39,6 +41,7 @@ class MainWindow(QMainWindow):
 
         self._last_palette: MaterialPalette | None = None
         self._thread: QThread | None = None
+        self._busy: QProgressDialog | None = None
 
         tabs = QTabWidget()
         tabs.addTab(self._build_color_tab(), "Colorizer")
@@ -98,8 +101,20 @@ class MainWindow(QMainWindow):
         box.setLayout(form)
         layout.addWidget(box)
 
+        step_hint = QLabel(
+            "<b>Detect</b> only reads the wallpaper path from Plasma. "
+            "To actually build and install colors, click <b>Generate and apply scheme</b> below."
+        )
+        step_hint.setWordWrap(True)
+        step_hint.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(step_hint)
+
         actions = QHBoxLayout()
         self._apply_btn = QPushButton("Generate and apply scheme")
+        self._apply_btn.setToolTip(
+            "Quantizes the image, runs Material You, writes ~/.local/share/color-schemes/PlasmaColorizer.colors, "
+            "then runs plasma-apply-colorscheme. This can take a few seconds."
+        )
         self._apply_btn.clicked.connect(self._on_generate)
         clear_manual = QPushButton("Clear override")
         clear_manual.setObjectName("secondary")
@@ -118,7 +133,12 @@ class MainWindow(QMainWindow):
         log_box.setLayout(log_layout)
         layout.addWidget(log_box)
 
-        self._append_log("Ready. Use Detect to read the active Plasma wallpaper.")
+        self._append_log(
+            "Ready.\n"
+            "• Use “Detect” to read the wallpaper path from Plasma (optional if you set Override).\n"
+            "• Use “Generate and apply scheme” to extract colors and apply them to Plasma — "
+            "this is the step that changes your desktop palette."
+        )
         return outer
 
     def _dark_choice(self) -> bool | None:
@@ -132,10 +152,19 @@ class MainWindow(QMainWindow):
         try:
             path = wp.current_wallpaper_image_path(self._monitor.value())
             self._path_display.setText(path)
-            self._append_log(f"Wallpaper: {path}")
+            self._append_log(f"Detected wallpaper file: {path}")
+            self._append_log(
+                "Next: click “Generate and apply scheme” to build a palette from this image and apply it in Plasma."
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Wallpaper", str(exc))
             self._append_log(f"Detect failed: {exc}")
+
+    def _close_busy(self) -> None:
+        if self._busy is not None:
+            self._busy.close()
+            self._busy.deleteLater()
+            self._busy = None
 
     def _on_generate(self) -> None:
         if self._thread and self._thread.isRunning():
@@ -144,7 +173,24 @@ class MainWindow(QMainWindow):
 
         manual = self._manual_path.text().strip() or None
         self._apply_btn.setEnabled(False)
-        self._append_log("Working…")
+        self._append_log(
+            "Generating… (quantize wallpaper → Material You palette → write .colors → plasma-apply-colorscheme)"
+        )
+
+        busy = QProgressDialog(self)
+        busy.setWindowTitle("PlasmaColorizer")
+        busy.setLabelText(
+            "Computing palette and applying to Plasma…\n(This may take a few seconds on large images.)"
+        )
+        busy.setRange(0, 0)
+        busy.setMinimumDuration(0)
+        busy.setModal(True)
+        cancel_btn = busy.cancelButton()
+        if cancel_btn is not None:
+            cancel_btn.setVisible(False)
+        busy.setMinimumWidth(420)
+        busy.show()
+        self._busy = busy
 
         thread = QThread()
         worker = GenerateSchemeWorker(
@@ -156,8 +202,8 @@ class MainWindow(QMainWindow):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(self._on_worker_finished)
-        worker.failed.connect(self._on_worker_failed)
+        worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(lambda: self._apply_btn.setEnabled(True))
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
@@ -168,16 +214,28 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_worker_finished(self, payload: object) -> None:
+        self._close_busy()
         src, mpl, written = payload  # type: ignore[misc]
         self._last_palette = mpl
         self._path_display.setText(str(src))
-        self._append_log(f"Applied scheme → {written}")
+        pri = mpl.colors.get("primary", (0, 0, 0))
+        self._append_log(f"Wrote color scheme file: {written}")
         self._append_log(
-            f"Palette: dark={mpl.is_dark}, primary={mpl.colors.get('primary', (0,0,0))}"
+            f"Applied scheme “{plasma_scheme.SCHEME_FILE_STEM}” (primary ≈ {rgb_to_hex(pri)})"
         )
-        QMessageBox.information(self, "PlasmaColorizer", "Color scheme generated and applied.")
+        scheme_hint = (
+            "If the desktop look barely changed, open "
+            "System Settings → Appearance → Colors and pick "
+            f"“{plasma_scheme.SCHEME_FILE_STEM}”."
+        )
+        QMessageBox.information(
+            self,
+            "PlasmaColorizer",
+            "Color scheme was generated and applied.\n\n" + scheme_hint,
+        )
 
     def _on_worker_failed(self, message: str) -> None:
+        self._close_busy()
         self._append_log(f"Error: {message}")
         QMessageBox.critical(self, "PlasmaColorizer", message)
 

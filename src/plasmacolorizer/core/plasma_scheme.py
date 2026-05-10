@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -240,8 +241,26 @@ def write_scheme_file(contents: str) -> Path:
     return path
 
 
+def find_apply_colorscheme_executable() -> str:
+    """Resolve `plasma-apply-colorscheme` — GUI apps often have a minimal PATH."""
+    for name in ("plasma-apply-colorscheme", "plasma-apply-colorscheme6"):
+        p = shutil.which(name)
+        if p:
+            return p
+    for candidate in (
+        "/usr/bin/plasma-apply-colorscheme",
+        "/usr/local/bin/plasma-apply-colorscheme",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError(
+        "plasma-apply-colorscheme was not found. Install the KDE Plasma workspace package "
+        "(e.g. `plasma-workspace` on Arch/Manjaro) or run PlasmaColorizer from a full login session."
+    )
+
+
 def apply_scheme() -> None:
-    exe = "plasma-apply-colorscheme"
+    exe = find_apply_colorscheme_executable()
     proc = subprocess.run(
         [exe, SCHEME_FILE_STEM],
         capture_output=True,
@@ -249,5 +268,6 @@ def apply_scheme() -> None:
         timeout=30,
     )
     if proc.returncode != 0:
-        msg = (proc.stderr or proc.stdout or "").strip() or f"{exe} exited {proc.returncode}"
-        raise RuntimeError(msg)
+        tail = (proc.stderr or proc.stdout or "").strip()
+        base = f"{exe} failed (exit {proc.returncode})"
+        raise RuntimeError(f"{base}: {tail}" if tail else base)
