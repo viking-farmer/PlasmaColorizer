@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QSize, Qt, QThread
+from PyQt6.QtCore import QObject, QSize, Qt, QThread
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -33,7 +33,13 @@ from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
 from plasmacolorizer.core.logger import get_logger, log_file_path
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
-from plasmacolorizer.workers import GenerateSchemeWorker, WorkerResult
+from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
+from plasmacolorizer.workers import (
+    ApplyPaletteWorker,
+    GenerateSchemeWorker,
+    PreviewPaletteWorker,
+    WorkerResult,
+)
 
 
 class MainWindow(QMainWindow):
@@ -47,8 +53,9 @@ class MainWindow(QMainWindow):
         self._logger.info("MainWindow started; log file: %s", self._log_file)
 
         self._last_palette: MaterialPalette | None = None
+        self._last_wallpaper_src: str = ""
         self._thread: QThread | None = None
-        self._worker: GenerateSchemeWorker | None = None
+        self._worker: QObject | None = None
         self._busy: QProgressDialog | None = None
 
         tabs = QTabWidget()
@@ -109,24 +116,110 @@ class MainWindow(QMainWindow):
         box.setLayout(form)
         layout.addWidget(box)
 
+        scheme_box = QGroupBox("Generated palette & scheme mapping")
+        scheme_layout = QVBoxLayout()
+        scheme_layout.setSpacing(10)
+
+        sw_row = QHBoxLayout()
+        sw_row.addWidget(QLabel("Swatches:"))
+        self._swatches: list[QLabel] = []
+        for _name in ("primary", "secondary", "tertiary", "surface", "onSurface"):
+            lab = QLabel()
+            lab.setMinimumSize(44, 28)
+            lab.setMaximumHeight(32)
+            lab.setToolTip(_name)
+            self._swatches.append(lab)
+            sw_row.addWidget(lab)
+        sw_row.addStretch(1)
+        scheme_layout.addLayout(sw_row)
+
+        map_form = QFormLayout()
+        self._accent_combo = QComboBox()
+        for label, key in (
+            ("Primary (default)", "primary"),
+            ("Secondary", "secondary"),
+            ("Tertiary", "tertiary"),
+            ("Primary fixed", "primaryFixed"),
+        ):
+            self._accent_combo.addItem(label, key)
+        self._accent_combo.setToolTip(
+            "Which Material color becomes the global Plasma accent and replaces "
+            "the usual primary / primaryDim / onPrimary roles in the scheme."
+        )
+
+        self._emphasis_combo = QComboBox()
+        for label, key in (
+            ("Secondary (default)", "secondary"),
+            ("Tertiary", "tertiary"),
+            ("Primary", "primary"),
+        ):
+            self._emphasis_combo.addItem(label, key)
+        self._emphasis_combo.setToolTip(
+            "Replaces neutral / positive foreground tokens that normally use secondary."
+        )
+
+        self._links_combo = QComboBox()
+        self._links_combo.addItem("Default (link + visited differ)", None)
+        for label, key in (
+            ("Tertiary", "tertiary"),
+            ("Primary", "primary"),
+            ("Secondary", "secondary"),
+            ("Primary fixed", "primaryFixed"),
+        ):
+            self._links_combo.addItem(f"Unify links: {label}", key)
+        self._links_combo.setToolTip(
+            "Default keeps KDE view link colors as in the built-in mapping. "
+            "Unify sets both visited and link text to the chosen Material color."
+        )
+
+        map_form.addRow("Plasma / KDE accent", self._accent_combo)
+        map_form.addRow("Neutral emphasis", self._emphasis_combo)
+        map_form.addRow("Application links", self._links_combo)
+        scheme_layout.addLayout(map_form)
+
+        scheme_box.setLayout(scheme_layout)
+        layout.addWidget(scheme_box)
+
         step_hint = QLabel(
-            "<b>Detect</b> only reads the wallpaper path from Plasma. "
-            "To actually build and install colors, click <b>Generate and apply scheme</b> below."
+            "<b>Detect</b> reads the wallpaper path. <b>Preview palette</b> builds Material You colors "
+            "from the image (CPU only). Adjust accent / emphasis / links, then "
+            "<b>Apply scheme to Plasma</b> to write files and refresh KDE — or use "
+            "<b>Generate and apply</b> for one step with the current mapping."
         )
         step_hint.setWordWrap(True)
         step_hint.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(step_hint)
 
         actions = QHBoxLayout()
+        self._preview_btn = QPushButton("Preview palette")
+        self._preview_btn.setObjectName("secondary")
+        self._preview_btn.setToolTip(
+            "Quantize the wallpaper and build a Material You palette. "
+            "Does not write ~/.config or restart Plasma until you apply."
+        )
+        self._preview_btn.clicked.connect(self._on_preview_palette)
+
+        self._apply_plasma_btn = QPushButton("Apply scheme to Plasma")
+        self._apply_plasma_btn.setObjectName("secondary")
+        self._apply_plasma_btn.setEnabled(False)
+        self._apply_plasma_btn.setToolTip(
+            "Writes the color scheme using the last previewed palette and the "
+            "accent / emphasis / link choices above, then runs the same refresh as Generate."
+        )
+        self._apply_plasma_btn.clicked.connect(self._on_apply_scheme_only)
+
         self._apply_btn = QPushButton("Generate and apply scheme")
         self._apply_btn.setToolTip(
             "Quantizes the image, runs Material You, writes ~/.local/share/color-schemes/PlasmaColorizer.colors, "
             "merges colors into ~/.config/kdeglobals, then refreshes KWin / PlasmaShell / global accent."
         )
         self._apply_btn.clicked.connect(self._on_generate)
+
         clear_manual = QPushButton("Clear override")
         clear_manual.setObjectName("secondary")
         clear_manual.clicked.connect(self._manual_path.clear)
+        actions.addWidget(self._preview_btn)
+        actions.addWidget(self._apply_plasma_btn)
         actions.addWidget(self._apply_btn)
         actions.addWidget(clear_manual)
         actions.addStretch(1)
@@ -155,15 +248,51 @@ class MainWindow(QMainWindow):
 
         self._append_log(
             "Ready.\n"
-            "  - Use Detect to read the wallpaper path from Plasma (optional if you set Override).\n"
-            "  - Use Generate and apply scheme to extract colors and apply them to Plasma.\n"
+            "  - Detect: read wallpaper path. Preview palette: build Material You colors (no disk writes).\n"
+            "  - Adjust accent / emphasis / links, then Apply scheme to Plasma — or Generate and apply in one step.\n"
             f"  - A detailed log is written to {self._log_file}"
         )
+        self._clear_swatches()
         return outer
 
     def _dark_choice(self) -> bool | None:
         idx = self._dark_combo.currentIndex()
         return None if idx == 0 else (True if idx == 1 else False)
+
+    def _scheme_choices(self) -> SchemeApplyChoices:
+        ac = self._accent_combo.currentData()
+        em = self._emphasis_combo.currentData()
+        li = self._links_combo.currentData()
+        return SchemeApplyChoices(
+            accent=str(ac) if ac is not None else "primary",
+            emphasis=str(em) if em is not None else "secondary",
+            links=li if isinstance(li, str) else None,
+        )
+
+    def _clear_swatches(self) -> None:
+        for lab in self._swatches:
+            lab.setToolTip("")
+            lab.setStyleSheet(
+                "QLabel { background: #2a2a32; border: 1px solid #444; border-radius: 4px; }"
+            )
+
+    def _update_palette_swatches(self, pal: MaterialPalette) -> None:
+        keys = ("primary", "secondary", "tertiary", "surface", "onSurface")
+        for key, lab in zip(keys, self._swatches, strict=True):
+            rgb = pal.colors.get(key, (40, 40, 48))
+            hx = rgb_to_hex(rgb)
+            lab.setToolTip(f"{key}  {hx}")
+            lab.setStyleSheet(
+                f"QLabel {{ background-color: {hx}; border: 1px solid #555; border-radius: 4px; }}"
+            )
+
+    def _set_color_tab_busy(self, running: bool) -> None:
+        self._preview_btn.setEnabled(not running)
+        self._apply_btn.setEnabled(not running)
+        if running:
+            self._apply_plasma_btn.setEnabled(False)
+        else:
+            self._apply_plasma_btn.setEnabled(self._last_palette is not None)
 
     def _append_log(self, msg: str) -> None:
         self._log.append(msg)
@@ -176,14 +305,18 @@ class MainWindow(QMainWindow):
             if not Path(manual).is_file():
                 QMessageBox.warning(self, "Wallpaper", f"Override path not found: {manual}")
                 return None
+            self._last_wallpaper_src = manual
             return manual
 
         existing = self._path_display.text().strip()
         if existing and Path(existing).is_file():
+            self._last_wallpaper_src = existing
             return existing
 
         try:
-            return wp.current_wallpaper_image_path(self._monitor.value())
+            p = wp.current_wallpaper_image_path(self._monitor.value())
+            self._last_wallpaper_src = p
+            return p
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(
                 self,
@@ -197,13 +330,106 @@ class MainWindow(QMainWindow):
         try:
             path = wp.current_wallpaper_image_path(self._monitor.value())
             self._path_display.setText(path)
+            self._last_wallpaper_src = path
             self._append_log(f"Detected wallpaper file: {path}")
-            self._append_log(
-                "Next: click Generate and apply scheme to build a palette from this image."
-            )
+            self._append_log("Next: Preview palette (recommended) or Generate and apply in one step.")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Wallpaper", str(exc))
             self._append_log(f"Detect failed: {exc}")
+
+    def _on_preview_palette(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._append_log("Already running.")
+            return
+        src = self._resolve_wallpaper_path()
+        if src is None:
+            return
+        self._path_display.setText(src)
+        self._last_wallpaper_src = src
+        self._set_color_tab_busy(True)
+        self._append_log("Preview: quantizing and building Material You palette…")
+
+        thread = QThread(self)
+        worker = PreviewPaletteWorker(
+            src_path=src,
+            green_strength=self._green_slider.value() / 100.0,
+            dark=self._dark_choice(),
+            quality=self._quality.value(),
+        )
+        self._thread = thread
+        self._worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._append_log, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_preview_worker_finished, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_thread_finished)
+        thread.start()
+
+    def _on_preview_worker_finished(self, mpl_obj: object) -> None:
+        pal = mpl_obj
+        if not isinstance(pal, MaterialPalette):
+            self._append_log("Preview finished with unexpected payload.")
+            return
+        self._last_palette = pal
+        self._update_palette_swatches(pal)
+        pri = pal.colors.get("primary", (0, 0, 0))
+        self._append_log(
+            f"Preview ready: primary={rgb_to_hex(pri)}, dark={pal.is_dark}. "
+            "Adjust accent / emphasis / links above, then Apply scheme to Plasma."
+        )
+
+    def _on_apply_scheme_only(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._append_log("Already running.")
+            return
+        if self._last_palette is None:
+            QMessageBox.information(
+                self,
+                "PlasmaColorizer",
+                "Preview a palette first (or use Generate and apply), then you can apply with custom mapping.",
+            )
+            return
+        src = self._path_display.text().strip()
+        if not src or not Path(src).is_file():
+            src = self._last_wallpaper_src
+        if not src or not Path(src).is_file():
+            QMessageBox.warning(self, "PlasmaColorizer", "No wallpaper image path — use Detect or set Override.")
+            return
+
+        self._set_color_tab_busy(True)
+        self._append_log("Applying palette to Plasma files (respecting mapping choices)…")
+
+        busy = QProgressDialog(self)
+        busy.setWindowTitle("PlasmaColorizer")
+        busy.setLabelText("Writing color scheme and updating KDE configuration…")
+        busy.setRange(0, 0)
+        busy.setMinimumDuration(0)
+        busy.setModal(False)
+        busy.setCancelButton(None)
+        busy.setMinimumWidth(440)
+        busy.show()
+        self._busy = busy
+
+        thread = QThread(self)
+        worker = ApplyPaletteWorker(
+            src_path=src,
+            palette=self._last_palette,
+            choices=self._scheme_choices(),
+        )
+        self._thread = thread
+        self._worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._append_log, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_thread_finished)
+        thread.start()
 
     def _close_busy(self) -> None:
         if self._busy is not None:
@@ -220,8 +446,9 @@ class MainWindow(QMainWindow):
         if src is None:
             return
         self._path_display.setText(src)
+        self._last_wallpaper_src = src
 
-        self._apply_btn.setEnabled(False)
+        self._set_color_tab_busy(True)
         self._append_log("Generating: quantize, build palette, write .colors, update kdeglobals.")
 
         busy = QProgressDialog(self)
@@ -244,6 +471,7 @@ class MainWindow(QMainWindow):
             green_strength=self._green_slider.value() / 100.0,
             dark=self._dark_choice(),
             quality=self._quality.value(),
+            choices=self._scheme_choices(),
         )
         # CRITICAL: keep strong references to BOTH thread and worker. Without
         # self._worker, the local `worker` is garbage-collected the moment
@@ -265,7 +493,7 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_thread_finished(self) -> None:
-        self._apply_btn.setEnabled(True)
+        self._set_color_tab_busy(False)
         if self._worker is not None:
             self._worker.deleteLater()
             self._worker = None
@@ -278,6 +506,7 @@ class MainWindow(QMainWindow):
         result: WorkerResult = payload  # type: ignore[assignment]
         self._last_palette = result.palette
         self._path_display.setText(str(result.src))
+        self._update_palette_swatches(result.palette)
         pri = result.palette.colors.get("primary", (0, 0, 0))
         self._append_log(f"Palette ready: primary={rgb_to_hex(pri)}, dark={result.palette.is_dark}")
 
@@ -295,7 +524,11 @@ class MainWindow(QMainWindow):
 
         # kdeglobals write succeeded; push palette to KWin, shell, and global accent (main thread).
         self._append_log("DBus: KWin + PlasmaShell + plasmashell.accentColor…")
-        notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(result.palette, timeout=2.0)
+        notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(
+            result.palette,
+            timeout=2.0,
+            choices=result.choices,
+        )
         self._append_log(notify_msg)
 
         restarted = False

@@ -11,10 +11,8 @@ Only deterministic, thread-safe work runs here:
   1. quantize the wallpaper image into a seed color (materialyoucolor),
   2. apply the optional green accent bias,
   3. build a full Material You palette,
-  4. write the ``.colors`` file under ``~/.local/share/color-schemes``,
-  5. write color sections into ``~/.config/kdeglobals``.
-  6. write a minimal Plasma **desktop theme** under ``~/.local/share/plasma/desktoptheme/``
-     and set ``~/.config/plasmarc`` ``[Theme] name=`` so panel / Kickoff use the palette.
+  4. optionally write the ``.colors`` file, ``kdeglobals``, and desktop theme
+     (see ``plasma_scheme.apply_material_palette_to_disk``).
 """
 
 from __future__ import annotations
@@ -30,6 +28,7 @@ from plasmacolorizer.core import palette as pal
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core.logger import get_logger
 from plasmacolorizer.core.palette import MaterialPalette
+from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
 
 
 @dataclass
@@ -40,10 +39,43 @@ class WorkerResult:
     kdeglobals_path: Path | None
     apply_ok: bool
     apply_error: str = ""
+    choices: SchemeApplyChoices | None = None
 
 
-class GenerateSchemeWorker(QObject):
-    finished = pyqtSignal(object)  # WorkerResult
+def compute_material_palette_from_wallpaper(
+    *,
+    src_path: str,
+    green_strength: float,
+    dark: bool | None,
+    quality: int,
+    log=None,
+) -> MaterialPalette:
+    """Quantize image, optional green bias, build Material You palette (no disk writes)."""
+    log = log or get_logger()
+    src = src_path
+    if not Path(src).is_file():
+        raise FileNotFoundError(f"Wallpaper image not found: {src}")
+
+    log.debug("quantize %s", src)
+    seed = pal.seed_color_from_image(src, quality=quality)
+    log.debug("seed argb = 0x%08x", seed)
+
+    if green_strength > 0:
+        seed = pal.apply_green_bias(seed, green_strength)
+        log.debug("seed after green bias = 0x%08x", seed)
+
+    if dark is None:
+        dark = kde_prefs.is_plasma_dark_scheme_preferred()
+    else:
+        dark = bool(dark)
+
+    return pal.build_palette(seed, dark=dark)
+
+
+class PreviewPaletteWorker(QObject):
+    """CPU-only path: wallpaper → MaterialPalette (no scheme files)."""
+
+    finished = pyqtSignal(object)  # MaterialPalette
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
 
@@ -62,35 +94,138 @@ class GenerateSchemeWorker(QObject):
         self._quality = quality
         self._log = get_logger()
 
-    # ------------------------------------------------------------------ utils
-
     def _emit(self, msg: str) -> None:
-        # Log only on the GUI thread via progress -> MainWindow._append_log to
-        # avoid duplicate file lines (same message from two thread IDs).
         self.progress.emit(msg)
-
-    # ----------------------------------------------------------------- run()
 
     def run(self) -> None:
         log = self._log
-        log.info("Worker.run() started")
+        log.info("PreviewPaletteWorker.run() started")
         try:
-            src = self._src_path
-            if not Path(src).is_file():
-                raise FileNotFoundError(
-                    f"Wallpaper image not found: {src}"
-                )
-            self._emit(f"Source image: {src}")
-
+            self._emit(f"Source image: {self._src_path}")
             self._emit(f"Quantizing image (quality={self._quality})...")
-            seed = pal.seed_color_from_image(src, quality=self._quality)
-            log.debug("seed argb = 0x%08x", seed)
-
             if self._green > 0:
                 self._emit(f"Applying green accent bias ({self._green * 100:.0f}%)...")
-                seed = pal.apply_green_bias(seed, self._green)
-                log.debug("seed after green bias = 0x%08x", seed)
+            if self._dark is None:
+                self._emit("Resolving dark/light from KDE preferences…")
+            else:
+                self._emit(f"Dark mode (forced): {bool(self._dark)}")
+            self._emit("Building Material You palette…")
+            mpl = compute_material_palette_from_wallpaper(
+                src_path=self._src_path,
+                green_strength=self._green,
+                dark=self._dark,
+                quality=self._quality,
+                log=log,
+            )
+            self._emit("Preview palette ready (not yet written to disk).")
+            self.finished.emit(mpl)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("PreviewPaletteWorker raised")
+            tb = traceback.format_exc(limit=4)
+            self.failed.emit(f"{exc}\n\n{tb}")
 
+
+class ApplyPaletteWorker(QObject):
+    """Write an existing MaterialPalette to scheme files + kdeglobals + desktop theme."""
+
+    finished = pyqtSignal(object)  # WorkerResult
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        src_path: str,
+        palette: MaterialPalette,
+        choices: SchemeApplyChoices | None,
+    ) -> None:
+        super().__init__()
+        self._src = src_path
+        self._palette = palette
+        self._choices = choices
+        self._log = get_logger()
+
+    def _emit(self, msg: str) -> None:
+        self.progress.emit(msg)
+
+    def run(self) -> None:
+        log = self._log
+        log.info("ApplyPaletteWorker.run() started")
+        try:
+            self._emit("Writing Plasma .colors file and kdeglobals…")
+            disk = plasma_scheme.apply_material_palette_to_disk(self._palette, self._choices)
+            if not disk.apply_ok:
+                self._emit(f"kdeglobals write failed: {disk.apply_error}")
+                self.finished.emit(WorkerResult(
+                    src=self._src,
+                    palette=self._palette,
+                    scheme_path=disk.scheme_path,
+                    kdeglobals_path=None,
+                    apply_ok=False,
+                    apply_error=disk.apply_error,
+                    choices=self._choices,
+                ))
+                return
+            self._emit(f"Scheme written: {disk.scheme_path}")
+            self._emit(f"kdeglobals updated: {disk.kdeglobals_path}")
+            if disk.desktop_theme_path:
+                self._emit(f"Desktop theme: {disk.desktop_theme_path}")
+            if disk.desktop_theme_error:
+                self._emit(
+                    f"Desktop theme / plasmarc step failed (Qt apps still updated): "
+                    f"{disk.desktop_theme_error}"
+                )
+            self._emit("Apply finished.")
+            self.finished.emit(WorkerResult(
+                src=self._src,
+                palette=self._palette,
+                scheme_path=disk.scheme_path,
+                kdeglobals_path=disk.kdeglobals_path,
+                apply_ok=True,
+                apply_error="",
+                choices=self._choices,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("ApplyPaletteWorker raised")
+            tb = traceback.format_exc(limit=4)
+            self.failed.emit(f"{exc}\n\n{tb}")
+
+
+class GenerateSchemeWorker(QObject):
+    """One-shot: build palette from wallpaper and apply to disk (same as Preview + Apply)."""
+
+    finished = pyqtSignal(object)  # WorkerResult
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        src_path: str,
+        green_strength: float,
+        dark: bool | None,
+        quality: int,
+        choices: SchemeApplyChoices | None = None,
+    ) -> None:
+        super().__init__()
+        self._src_path = src_path
+        self._green = green_strength
+        self._dark = dark
+        self._quality = quality
+        self._choices = choices
+        self._log = get_logger()
+
+    def _emit(self, msg: str) -> None:
+        self.progress.emit(msg)
+
+    def run(self) -> None:
+        log = self._log
+        log.info("GenerateSchemeWorker.run() started")
+        try:
+            self._emit(f"Source image: {self._src_path}")
+            self._emit(f"Quantizing image (quality={self._quality})...")
+            if self._green > 0:
+                self._emit(f"Applying green accent bias ({self._green * 100:.0f}%)...")
             if self._dark is None:
                 dark = kde_prefs.is_plasma_dark_scheme_preferred()
                 self._emit(f"Dark mode (follow KDE): {dark}")
@@ -99,51 +234,50 @@ class GenerateSchemeWorker(QObject):
                 self._emit(f"Dark mode (forced): {dark}")
 
             self._emit("Building Material You palette...")
-            mpl = pal.build_palette(seed, dark=dark)
+            mpl = compute_material_palette_from_wallpaper(
+                src_path=self._src_path,
+                green_strength=self._green,
+                dark=self._dark,
+                quality=self._quality,
+                log=log,
+            )
 
-            self._emit("Writing Plasma .colors file...")
-            body = plasma_scheme.render_colors_file(mpl)
-            written = plasma_scheme.write_scheme_file(body)
-            self._emit(f"Scheme written: {written}")
+            self._emit("Writing Plasma .colors file and kdeglobals…")
+            disk = plasma_scheme.apply_material_palette_to_disk(mpl, self._choices)
+            if not disk.apply_ok:
+                self._emit(disk.apply_error)
+                self.finished.emit(WorkerResult(
+                    src=self._src_path,
+                    palette=mpl,
+                    scheme_path=disk.scheme_path,
+                    kdeglobals_path=None,
+                    apply_ok=False,
+                    apply_error=disk.apply_error,
+                    choices=self._choices,
+                ))
+                return
 
-            self._emit("Updating ~/.config/kdeglobals...")
-            apply_ok = True
-            apply_error = ""
-            kdg_path: Path | None = None
-            try:
-                kdg_path = plasma_scheme.apply_to_kdeglobals(mpl)
-                self._emit(f"kdeglobals updated: {kdg_path}")
-            except Exception as exc:  # noqa: BLE001
-                apply_ok = False
-                apply_error = f"kdeglobals write failed: {exc}"
-                log.exception("kdeglobals write failed")
-                self._emit(apply_error)
-
-            if apply_ok:
-                self._emit("Writing Plasma desktop theme (panel / Kickoff colours)…")
-                try:
-                    theme_root = plasma_scheme.write_plasma_desktop_theme(mpl)
-                    self._emit(f"Desktop theme: {theme_root}")
-                    prc = plasma_scheme.merge_user_plasmarc_select_desktop_theme()
-                    self._emit(
-                        f"plasmarc → [Theme] name={plasma_scheme.DESKTOP_THEME_ID} ({prc})"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    warn = f"Desktop theme / plasmarc step failed (Qt apps still updated): {exc}"
-                    log.exception("plasma desktop theme failed")
-                    self._emit(warn)
-
+            self._emit(f"Scheme written: {disk.scheme_path}")
+            self._emit(f"kdeglobals updated: {disk.kdeglobals_path}")
+            if disk.desktop_theme_path:
+                self._emit(f"Desktop theme: {disk.desktop_theme_path}")
+            if disk.desktop_theme_error:
+                self._emit(
+                    f"Desktop theme / plasmarc step failed (Qt apps still updated): "
+                    f"{disk.desktop_theme_error}"
+                )
             self._emit("Worker finished")
             self.finished.emit(WorkerResult(
-                src=src,
+                src=self._src_path,
                 palette=mpl,
-                scheme_path=written,
-                kdeglobals_path=kdg_path,
-                apply_ok=apply_ok,
-                apply_error=apply_error,
+                scheme_path=disk.scheme_path,
+                kdeglobals_path=disk.kdeglobals_path,
+                apply_ok=True,
+                apply_error="",
+                choices=self._choices,
             ))
 
-        except Exception as exc:  # noqa: BLE001 - surfaced to UI
-            log.exception("Worker raised")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("GenerateSchemeWorker raised")
             tb = traceback.format_exc(limit=4)
             self.failed.emit(f"{exc}\n\n{tb}")

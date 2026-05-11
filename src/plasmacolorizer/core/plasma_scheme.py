@@ -29,9 +29,69 @@ import shutil
 import subprocess
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
+from materialyoucolor.dynamiccolor.color_spec import COLOR_NAMES
+
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex, rgb_tuple_to_argb_u
+
+_MATERIAL_NAMES = frozenset(COLOR_NAMES)
+_PRIMARY_TRIO = ("primary", "primaryDim", "onPrimary")
+_ALLOWED_ACCENT = frozenset({"primary", "secondary", "tertiary", "primaryFixed"})
+_ALLOWED_EMPHASIS = frozenset({"primary", "secondary", "tertiary"})
+_ALLOWED_LINKS = frozenset({"tertiary", "primary", "secondary", "primaryFixed"})
+
+
+@dataclass(frozen=True)
+class SchemeApplyChoices:
+    """Maps Material dynamic roles onto KDE chrome when writing the color scheme."""
+
+    #: Replaces ``primary`` / ``primaryDim`` / ``onPrimary`` tokens in all KDE groups.
+    accent: str = "primary"
+    #: Replaces ``secondary`` / ``secondaryDim`` in neutral / positive foreground rows.
+    emphasis: str = "secondary"
+    #: When set, ``Colors:View`` link + visited foregrounds both use this Material token.
+    links: str | None = None
+
+
+def normalize_scheme_apply_choices(ch: SchemeApplyChoices | None) -> SchemeApplyChoices:
+    if ch is None:
+        return SchemeApplyChoices()
+    a = ch.accent if ch.accent in _ALLOWED_ACCENT else "primary"
+    e = ch.emphasis if ch.emphasis in _ALLOWED_EMPHASIS else "secondary"
+    ln = ch.links if (ch.links is None or ch.links in _ALLOWED_LINKS) else None
+    return SchemeApplyChoices(accent=a, emphasis=e, links=ln)
+
+
+def _accent_family_tokens(accent: str) -> tuple[str, str, str]:
+    families = {
+        "primary": _PRIMARY_TRIO,
+        "secondary": ("secondary", "secondaryDim", "onSecondary"),
+        "tertiary": ("tertiary", "tertiaryDim", "onTertiary"),
+        "primaryFixed": ("primaryFixed", "primaryFixedDim", "onPrimaryFixed"),
+    }
+    return families.get(accent, _PRIMARY_TRIO)
+
+
+def remap_material_token(mat: str, ch: SchemeApplyChoices | None) -> str:
+    """Rewrite a Material token from our static tables according to user scheme choices."""
+    if ch is None:
+        return mat
+    ch = normalize_scheme_apply_choices(ch)
+    src = _PRIMARY_TRIO
+    dst = _accent_family_tokens(ch.accent)
+    primary_map = dict(zip(src, dst, strict=True))
+    if mat in primary_map:
+        return primary_map[mat]
+    if mat == "inversePrimary" and ch.accent != "primary":
+        return "inverseSurface"
+    if mat == "secondary":
+        return ch.emphasis
+    if mat == "secondaryDim":
+        dim = f"{ch.emphasis}Dim"
+        return dim if dim in _MATERIAL_NAMES else "secondaryDim"
+    return mat
 
 
 SCHEME_FILE_STEM = "PlasmaColorizer"
@@ -195,7 +255,11 @@ def default_fallback_desktop_theme() -> str:
     return "default"
 
 
-def write_plasma_desktop_theme(pal: MaterialPalette) -> Path:
+def write_plasma_desktop_theme(
+    pal: MaterialPalette,
+    *,
+    choices: SchemeApplyChoices | None = None,
+) -> Path:
     """
     Install a Plasma **desktop theme** (Plasma Style) that reuses our palette.
 
@@ -207,7 +271,7 @@ def write_plasma_desktop_theme(pal: MaterialPalette) -> Path:
     root = plasma_desktop_theme_dir()
     root.mkdir(parents=True, exist_ok=True)
     fallback = default_fallback_desktop_theme()
-    (root / "colors").write_text(render_colors_file(pal), encoding="utf-8")
+    (root / "colors").write_text(render_colors_file(pal, choices=choices), encoding="utf-8")
 
     meta = {
         "KPlugin": {
@@ -262,13 +326,24 @@ def _rgb_csv(rgb: tuple[int, int, int]) -> str:
     return f"{r},{g},{b}"
 
 
-def _resolve(mapping: dict[str, str], palette: dict[str, tuple[int, int, int]]) -> dict[str, str]:
+def _resolve(
+    mapping: dict[str, str],
+    palette: dict[str, tuple[int, int, int]],
+    choices: SchemeApplyChoices | None,
+) -> dict[str, str]:
     """Resolve a Material-token mapping into KDE 'r,g,b' strings."""
-    return {kde_key: _rgb_csv(palette[mat_name]) for kde_key, mat_name in mapping.items()}
+    return {
+        kde_key: _rgb_csv(palette[remap_material_token(mat_name, choices)])
+        for kde_key, mat_name in mapping.items()
+    }
 
 
-def build_color_sections(pal: MaterialPalette) -> dict[str, dict[str, str]]:
+def build_color_sections(
+    pal: MaterialPalette,
+    choices: SchemeApplyChoices | None = None,
+) -> dict[str, dict[str, str]]:
     """All KDE color sections to write to either the `.colors` file or kdeglobals."""
+    ch = normalize_scheme_apply_choices(choices)
     c = pal.colors
     sections: dict[str, dict[str, str]] = {
         "ColorEffects:Disabled": {
@@ -291,28 +366,40 @@ def build_color_sections(pal: MaterialPalette) -> dict[str, dict[str, str]]:
             "IntensityAmount": "0",
             "IntensityEffect": "0",
         },
-        "Colors:Button": _resolve(_BUTTON, c),
-        "Colors:Complementary": _resolve(_WINDOW, c),
-        "Colors:Header": _resolve(_HEADER, c),
-        "Colors:Header][Inactive": _resolve(_HEADER_INACTIVE, c),
-        "Colors:Selection": _resolve(_SELECTION, c),
-        "Colors:Tooltip": _resolve(_TOOLTIP, c),
-        "Colors:View": _resolve(_VIEW, c),
-        "Colors:Window": _resolve(_WINDOW, c),
+        "Colors:Button": _resolve(_BUTTON, c, ch),
+        "Colors:Complementary": _resolve(_WINDOW, c, ch),
+        "Colors:Header": _resolve(_HEADER, c, ch),
+        "Colors:Header][Inactive": _resolve(_HEADER_INACTIVE, c, ch),
+        "Colors:Selection": _resolve(_SELECTION, c, ch),
+        "Colors:Tooltip": _resolve(_TOOLTIP, c, ch),
+        "Colors:View": _resolve(_VIEW, c, ch),
+        "Colors:Window": _resolve(_WINDOW, c, ch),
     }
+    if ch.links:
+        view = sections["Colors:View"]
+        rgb = _rgb_csv(c[ch.links])
+        view["ForegroundLink"] = rgb
+        view["ForegroundVisited"] = rgb
     return sections
 
 
-def render_colors_file(pal: MaterialPalette, *, display_name: str | None = None) -> str:
+def render_colors_file(
+    pal: MaterialPalette,
+    *,
+    display_name: str | None = None,
+    choices: SchemeApplyChoices | None = None,
+) -> str:
     """Build full `.colors` contents from Material palette."""
     name = display_name or "PlasmaColorizer"
-    sections = build_color_sections(pal)
+    ch = normalize_scheme_apply_choices(choices)
+    sections = build_color_sections(pal, ch)
+    accent_hex = rgb_to_hex(pal.colors[ch.accent])
 
     parts: list[str] = []
     parts.append(textwrap.dedent(
         f"""\
         # SPDX-License-Identifier: MIT
-        # Generated by PlasmaColorizer — seed accent {rgb_to_hex(pal.colors['primary'])}
+        # Generated by PlasmaColorizer — accent role {ch.accent} {accent_hex} (seed primary {rgb_to_hex(pal.colors['primary'])})
 
         [General]
         ColorScheme={SCHEME_FILE_STEM}
@@ -454,9 +541,13 @@ def _set_general_kv(text: str, key: str, value: str) -> str:
     return text + f"[General]\n{new_line}"
 
 
-def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
+def apply_to_kdeglobals(
+    pal: MaterialPalette,
+    choices: SchemeApplyChoices | None = None,
+) -> Path:
     """Write Material palette sections + ``[General]`` keys into ``~/.config/kdeglobals``."""
-    sections = build_color_sections(pal)
+    ch = normalize_scheme_apply_choices(choices)
+    sections = build_color_sections(pal, ch)
 
     text = _read_kdeglobals_text()
     text = _set_general_color_scheme(text, SCHEME_FILE_STEM)
@@ -466,7 +557,7 @@ def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
         digest = hashlib.sha1(scheme_path.read_bytes()).hexdigest()
         text = _set_general_kv(text, "ColorSchemeHash", digest)
 
-    pri = pal.colors["primary"]
+    pri = pal.colors[ch.accent]
     text = _set_general_kv(text, "AccentColor", f"{pri[0]},{pri[1]},{pri[2]}")
     text = _set_general_kv(text, "accentColorFromWallpaper", "false")
 
@@ -482,7 +573,58 @@ def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
     return path
 
 
-def notify_kde_palette_change(pal: MaterialPalette, *, timeout: float = 2.0) -> tuple[bool, str]:
+@dataclass
+class DiskApplyResult:
+    """Outcome of writing scheme files and merging Plasma desktop theme metadata."""
+
+    scheme_path: Path
+    kdeglobals_path: Path | None
+    apply_ok: bool
+    apply_error: str = ""
+    desktop_theme_path: Path | None = None
+    desktop_theme_error: str = ""
+
+
+def apply_material_palette_to_disk(
+    pal: MaterialPalette,
+    choices: SchemeApplyChoices | None = None,
+) -> DiskApplyResult:
+    """Write ``.colors``, ``kdeglobals`` color sections, and install the desktop theme (best-effort)."""
+    ch = normalize_scheme_apply_choices(choices)
+    body = render_colors_file(pal, choices=ch)
+    scheme_path = write_scheme_file(body)
+    try:
+        kdg = apply_to_kdeglobals(pal, ch)
+    except Exception as exc:  # noqa: BLE001
+        return DiskApplyResult(
+            scheme_path=scheme_path,
+            kdeglobals_path=None,
+            apply_ok=False,
+            apply_error=str(exc),
+        )
+    dpath: Path | None = None
+    derr = ""
+    try:
+        dpath = write_plasma_desktop_theme(pal, choices=ch)
+        merge_user_plasmarc_select_desktop_theme()
+    except Exception as exc:  # noqa: BLE001
+        derr = str(exc)
+    return DiskApplyResult(
+        scheme_path=scheme_path,
+        kdeglobals_path=kdg,
+        apply_ok=True,
+        apply_error="",
+        desktop_theme_path=dpath,
+        desktop_theme_error=derr,
+    )
+
+
+def notify_kde_palette_change(
+    pal: MaterialPalette,
+    *,
+    timeout: float = 2.0,
+    choices: SchemeApplyChoices | None = None,
+) -> tuple[bool, str]:
     """
     Ask KWin, PlasmaShell, and the accent-color service to pick up ``kdeglobals``.
 
@@ -498,6 +640,7 @@ def notify_kde_palette_change(pal: MaterialPalette, *, timeout: float = 2.0) -> 
     The ``timeout`` parameter is kept for API compatibility; it is unused.
     """
     del timeout  # API compat; calls are synchronous and expected to be fast
+    ch = normalize_scheme_apply_choices(choices)
     parts: list[str] = []
     ok_any = False
     try:
@@ -524,7 +667,7 @@ def notify_kde_palette_change(pal: MaterialPalette, *, timeout: float = 2.0) -> 
         parts.append(f"PlasmaShell.refreshCurrentShell: {exc}")
 
     try:
-        argb = rgb_tuple_to_argb_u(pal.colors["primary"])
+        argb = rgb_tuple_to_argb_u(pal.colors[ch.accent])
         ac = bus.get_object("org.kde.plasmashell.accentColor", "/AccentColor")
         dbus.Interface(ac, "org.kde.plasmashell.accentColor").setAccentColor(dbus.UInt32(argb))
         parts.append("plasmashell.accentColor.setAccentColor OK")
