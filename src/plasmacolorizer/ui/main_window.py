@@ -185,9 +185,8 @@ class MainWindow(QMainWindow):
         busy.setRange(0, 0)
         busy.setMinimumDuration(0)
         busy.setModal(True)
-        cancel_btn = busy.cancelButton()
-        if cancel_btn is not None:
-            cancel_btn.setVisible(False)
+        # PyQt6 exposes setCancelButton (no cancelButton()); None removes the Cancel action.
+        busy.setCancelButton(None)
         busy.setMinimumWidth(420)
         busy.show()
         self._busy = busy
