@@ -9,6 +9,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".jxl"}
+
 PLASMA_SERVICE = "org.kde.plasmashell"
 PLASMA_PATH = "/PlasmaShell"
 PLASMA_IFACE = "org.kde.PlasmaShell"
@@ -22,21 +24,95 @@ def _dbus_session_interface():
     return dbus.Interface(obj, PLASMA_IFACE)
 
 
-def _normalize_image_value(val: Any) -> str | None:
-    if val is None:
-        return None
-    if isinstance(val, bytes):
-        val = val.decode("utf-8", errors="replace")
-    s = str(val).strip()
-    if not s:
-        return None
+def _strip_file_scheme(val: str) -> str:
+    s = val.strip()
     if s.startswith("file://"):
         s = s[7:]
-    s = s.replace("%20", " ")
-    if os.path.isdir(s):
+    return s.replace("%20", " ")
+
+
+def _collect_images_under(dir_path: str, max_depth: int = 4) -> list[str]:
+    """Collect image files under a wallpaper package folder (non-recursive first, then shallow walk)."""
+    if not os.path.isdir(dir_path):
+        return []
+    base_depth = dir_path.rstrip(os.sep).count(os.sep)
+    out: list[str] = []
+    for root, dirs, files in os.walk(dir_path):
+        depth = root.count(os.sep) - base_depth
+        if depth > max_depth:
+            dirs.clear()
+            continue
+        for name in files:
+            if os.path.splitext(name)[1].lower() in _IMAGE_EXTS:
+                out.append(os.path.join(root, name))
+    return out
+
+
+def _pick_representative_image(paths: list[str]) -> str | None:
+    """Prefer a small landscape file (similar intent to kde-material-you-colors)."""
+    if not paths:
+        return None
+    paths = sorted(paths, key=os.path.getsize)
+    try:
+        from PIL import Image  # type: ignore[import-untyped]
+
+        landscape: list[str] = []
+        portrait: list[str] = []
+        for path in paths:
+            try:
+                with Image.open(path) as im:
+                    w, h = im.size
+            except OSError:
+                continue
+            (landscape if w >= h else portrait).append(path)
+        if landscape:
+            return landscape[0]
+        if portrait:
+            return portrait[0]
+    except ImportError:
+        pass
+    return paths[0]
+
+
+def _path_from_plasma_wallpaper_package_dir(root: str, prefer_light: bool) -> str | None:
+    """
+    KDE often stores `Image` as a *directory* (wallpaper package), not a single file.
+    Resolve to an image under contents/images or contents/images_dark.
+    """
+    root = os.path.abspath(root.rstrip(os.sep))
+    dark = os.path.join(root, "contents", "images_dark")
+    normal = os.path.join(root, "contents", "images")
+    chosen: str | None = None
+    if prefer_light:
+        if os.path.isdir(normal):
+            chosen = normal
+        elif os.path.isdir(dark):
+            chosen = dark
+    else:
+        if os.path.isdir(dark):
+            chosen = dark
+        elif os.path.isdir(normal):
+            chosen = normal
+    if chosen is None:
+        return None
+    candidates = _collect_images_under(chosen)
+    picked = _pick_representative_image(candidates)
+    return os.path.abspath(picked) if picked else None
+
+
+def _resolve_wallpaper_path_candidate(raw: Any, prefer_light: bool) -> str | None:
+    """Resolve DBus / script `Image` value to a readable image file (file or wallpaper package dir)."""
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    s = _strip_file_scheme(str(raw))
+    if not s:
         return None
     if os.path.isfile(s):
         return os.path.abspath(s)
+    if os.path.isdir(s):
+        return _path_from_plasma_wallpaper_package_dir(s, prefer_light)
     return None
 
 
@@ -73,8 +149,6 @@ def _wallpaper_via_plasma_api(monitor: int) -> dict[str, Any] | None:
     """Use PlasmaShell.wallpaper(monitor) when available (kde-material-you-colors style)."""
     try:
         iface = _dbus_session_interface()
-        if not hasattr(iface, "wallpaper"):
-            return None
         out = iface.wallpaper(int(monitor))
     except Exception as exc:  # noqa: BLE001 — DBus surface broad on purpose
         logger.debug("PlasmaShell.wallpaper failed: %s", exc)
@@ -87,48 +161,63 @@ def _wallpaper_via_plasma_api(monitor: int) -> dict[str, Any] | None:
 
 def _path_from_config(wcfg: dict[str, Any], prefer_light: bool) -> str | None:
     """Pick a file path from wallpaper config dict."""
-    img = wcfg.get("Image") or wcfg.get("image")
-    path = _normalize_image_value(img)
-    if path:
-        return path
+    for key in ("Image", "image"):
+        path = _resolve_wallpaper_path_candidate(wcfg.get(key), prefer_light)
+        if path:
+            return path
     slide = wcfg.get("SlidePaths") or wcfg.get("slidePaths")
     if slide:
-        first = slide[0] if isinstance(slide, (list, tuple)) else slide
-        p = _normalize_image_value(first)
-        if p:
-            return p
+        seq = slide if isinstance(slide, (list, tuple)) else [slide]
+        for item in seq:
+            p = _resolve_wallpaper_path_candidate(item, prefer_light)
+            if p:
+                return p
     return None
 
 
-_EVAL_SCRIPT = r"""
+# __PC_MON__ is replaced with the integer screen index (Plasma desktop.screen).
+_EVAL_SCRIPT_TEMPLATE = r"""
 (function () {
-  const desks = desktops();
+  var target = __PC_MON__;
+  function collect(desks, useScreenFilter) {
+    var lines = [];
+    for (var i = 0; i < desks.length; i++) {
+      var d = desks[i];
+      if (useScreenFilter && typeof target === "number" && target >= 0
+          && typeof d.screen !== "undefined" && d.screen !== target) {
+        continue;
+      }
+      var plugin = d.wallpaperPlugin;
+      if (!plugin) { continue; }
+      d.currentConfigGroup = ["Wallpaper", plugin, "General"];
+      var img = d.readConfig("Image");
+      if (img && String(img).length) {
+        lines.push(String(img));
+      }
+    }
+    return lines;
+  }
+  var desks = desktops();
   if (!desks.length) {
     return "ERROR:no_desktops";
   }
-  const lines = [];
-  for (let i = 0; i < desks.length; i++) {
-    const d = desks[i];
-    var plugin = d.wallpaperPlugin;
-    if (!plugin) { continue; }
-    d.currentConfigGroup = ['Wallpaper', plugin, 'General'];
-    var img = d.readConfig('Image');
-    if (img && img.length) {
-      lines.push(String(img));
-    }
+  var lines = collect(desks, true);
+  if (!lines.length) {
+    lines = collect(desks, false);
   }
-  if (!lines.length) { return "ERROR:no_images"; }
+  if (!lines.length) {
+    return "ERROR:no_images";
+  }
   return lines[0];
 })();
 """
 
 
-def _wallpaper_via_evaluate_script() -> str | None:
+def _wallpaper_via_evaluate_script(monitor: int, prefer_light: bool) -> str | None:
     try:
         iface = _dbus_session_interface()
-        if not hasattr(iface, "evaluateScript"):
-            return None
-        out = iface.evaluateScript(_EVAL_SCRIPT)
+        script = _EVAL_SCRIPT_TEMPLATE.replace("__PC_MON__", str(int(monitor)))
+        out = iface.evaluateScript(script)
     except Exception as exc:  # noqa: BLE001
         logger.debug("evaluateScript failed: %s", exc)
         return None
@@ -138,7 +227,7 @@ def _wallpaper_via_evaluate_script() -> str | None:
     text = text.strip().strip('"').replace("%20", " ")
     if text.startswith("ERROR:"):
         return None
-    return _normalize_image_value(text)
+    return _resolve_wallpaper_path_candidate(text, prefer_light)
 
 
 def _wallpaper_via_qdbus(monitor: int) -> str | None:
@@ -178,12 +267,13 @@ def current_wallpaper_image_path(monitor: int = 0, prefer_light: bool = False) -
         plugin = str(wcfg.get("wallpaperPlugin") or wcfg.get("WallpaperPlugin") or "")
         logger.info("Wallpaper plugin %s did not yield a file path; trying script API", plugin)
 
-    path = _wallpaper_via_evaluate_script()
+    path = _wallpaper_via_evaluate_script(monitor, prefer_light)
     if path:
         return path
 
     _wallpaper_via_qdbus(monitor)  # best-effort log path
     raise FileNotFoundError(
         "Could not resolve wallpaper image. "
-        "Use a static picture wallpaper (org.kde.image) or set a manual path when supported."
+        "Use the Image wallpaper (org.kde.image), a bundled wallpaper package, "
+        "or set Override to an image file."
     )
