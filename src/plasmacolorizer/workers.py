@@ -27,7 +27,7 @@ from plasmacolorizer.core import kde_prefs
 from plasmacolorizer.core import palette as pal
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core.logger import get_logger
-from plasmacolorizer.core.palette import MaterialPalette
+from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_overrides
 from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
 
 
@@ -206,6 +206,7 @@ class GenerateSchemeWorker(QObject):
         dark: bool | None,
         quality: int,
         choices: SchemeApplyChoices | None = None,
+        swatch_overrides: dict[str, tuple[int, int, int]] | None = None,
     ) -> None:
         super().__init__()
         self._src_path = src_path
@@ -213,6 +214,7 @@ class GenerateSchemeWorker(QObject):
         self._dark = dark
         self._quality = quality
         self._choices = choices
+        self._swatch_overrides = dict(swatch_overrides) if swatch_overrides else {}
         self._log = get_logger()
 
     def _emit(self, msg: str) -> None:
@@ -241,6 +243,9 @@ class GenerateSchemeWorker(QObject):
                 quality=self._quality,
                 log=log,
             )
+            if self._swatch_overrides:
+                mpl = merge_palette_color_overrides(mpl, self._swatch_overrides)
+                self._emit("Applied manual swatch overrides before writing scheme.")
 
             self._emit("Writing Plasma .colors file and kdeglobals…")
             disk = plasma_scheme.apply_material_palette_to_disk(mpl, self._choices)

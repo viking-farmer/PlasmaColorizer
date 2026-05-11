@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QSize, Qt, QThread
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread
+from PyQt6.QtGui import QColor, QCloseEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -24,6 +26,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -32,7 +35,7 @@ from plasmacolorizer.conky.templating import context_from_palette, render_templa
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
 from plasmacolorizer.core.logger import get_logger, log_file_path
-from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
+from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_overrides, rgb_to_hex
 from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
 from plasmacolorizer.workers import (
     ApplyPaletteWorker,
@@ -40,6 +43,9 @@ from plasmacolorizer.workers import (
     PreviewPaletteWorker,
     WorkerResult,
 )
+
+
+_SWATCH_KEYS = ("primary", "secondary", "tertiary", "surface", "onSurface")
 
 
 class MainWindow(QMainWindow):
@@ -53,6 +59,7 @@ class MainWindow(QMainWindow):
         self._logger.info("MainWindow started; log file: %s", self._log_file)
 
         self._last_palette: MaterialPalette | None = None
+        self._swatch_overrides: dict[str, tuple[int, int, int]] = {}
         self._last_wallpaper_src: str = ""
         self._thread: QThread | None = None
         self._worker: QObject | None = None
@@ -122,16 +129,38 @@ class MainWindow(QMainWindow):
 
         sw_row = QHBoxLayout()
         sw_row.addWidget(QLabel("Swatches:"))
-        self._swatches: list[QLabel] = []
-        for _name in ("primary", "secondary", "tertiary", "surface", "onSurface"):
-            lab = QLabel()
-            lab.setMinimumSize(44, 28)
-            lab.setMaximumHeight(32)
-            lab.setToolTip(_name)
-            self._swatches.append(lab)
-            sw_row.addWidget(lab)
+        self._swatch_buttons: list[QToolButton] = []
+        for key in _SWATCH_KEYS:
+            btn = QToolButton()
+            btn.setMinimumSize(48, 30)
+            btn.setMaximumHeight(34)
+            btn.setAutoRaise(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(
+                f"{key} — click to open the color dialog. "
+                "On Plasma, the system picker often includes a screen color dropper. "
+                "Right-click to reset this swatch."
+            )
+            btn.clicked.connect(lambda checked=False, k=key: self._edit_swatch_color(k))
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, k=key, b=btn: self._on_swatch_context_menu(k, b.mapToGlobal(pos))
+            )
+            self._swatch_buttons.append(btn)
+            sw_row.addWidget(btn)
+        reset_sw = QPushButton("Reset swatches")
+        reset_sw.setObjectName("secondary")
+        reset_sw.setToolTip("Clear all manual swatch colors (back to generated preview).")
+        reset_sw.clicked.connect(self._on_reset_swatches)
+        sw_row.addWidget(reset_sw)
         sw_row.addStretch(1)
         scheme_layout.addLayout(sw_row)
+        sw_hint = QLabel(
+            "Click a swatch to choose a color (native dialog; KDE often provides a dropper). "
+            "Overrides apply when you use Apply or Generate."
+        )
+        sw_hint.setWordWrap(True)
+        scheme_layout.addWidget(sw_hint)
 
         map_form = QFormLayout()
         self._accent_combo = QComboBox()
@@ -249,7 +278,8 @@ class MainWindow(QMainWindow):
         self._append_log(
             "Ready.\n"
             "  - Detect: read wallpaper path. Preview palette: build Material You colors (no disk writes).\n"
-            "  - Adjust accent / emphasis / links, then Apply scheme to Plasma — or Generate and apply in one step.\n"
+            "  - Click swatches to pick colors (KDE’s dialog often includes a screen dropper).\n"
+            "  - Adjust accent / emphasis / links, then Apply — or Generate and apply in one step.\n"
             f"  - A detailed log is written to {self._log_file}"
         )
         self._clear_swatches()
@@ -269,22 +299,74 @@ class MainWindow(QMainWindow):
             links=li if isinstance(li, str) else None,
         )
 
+    def _effective_palette(self) -> MaterialPalette | None:
+        if self._last_palette is None:
+            return None
+        return merge_palette_color_overrides(self._last_palette, self._swatch_overrides)
+
     def _clear_swatches(self) -> None:
-        for lab in self._swatches:
-            lab.setToolTip("")
-            lab.setStyleSheet(
-                "QLabel { background: #2a2a32; border: 1px solid #444; border-radius: 4px; }"
+        self._swatch_overrides.clear()
+        for btn in self._swatch_buttons:
+            btn.setToolTip("")
+            btn.setStyleSheet(
+                "QToolButton { background: #2a2a32; border: 1px solid #444; border-radius: 6px; }"
             )
 
-    def _update_palette_swatches(self, pal: MaterialPalette) -> None:
-        keys = ("primary", "secondary", "tertiary", "surface", "onSurface")
-        for key, lab in zip(keys, self._swatches, strict=True):
-            rgb = pal.colors.get(key, (40, 40, 48))
+    def _update_palette_swatches(self, pal: MaterialPalette | None = None) -> None:
+        base = pal if pal is not None else self._last_palette
+        if base is None:
+            self._clear_swatches()
+            return
+        eff = merge_palette_color_overrides(base, self._swatch_overrides)
+        for key, btn in zip(_SWATCH_KEYS, self._swatch_buttons, strict=True):
+            rgb = eff.colors.get(key, (40, 40, 48))
             hx = rgb_to_hex(rgb)
-            lab.setToolTip(f"{key}  {hx}")
-            lab.setStyleSheet(
-                f"QLabel {{ background-color: {hx}; border: 1px solid #555; border-radius: 4px; }}"
+            border = "#c9a227" if key in self._swatch_overrides else "#555"
+            btn.setToolTip(
+                f"{key}  {hx}"
+                + ("  (manual)" if key in self._swatch_overrides else "  — click to edit")
             )
+            btn.setStyleSheet(
+                f"QToolButton {{ background-color: {hx}; border: 2px solid {border}; "
+                "border-radius: 6px; }}"
+            )
+
+    def _edit_swatch_color(self, key: str) -> None:
+        eff = self._effective_palette()
+        if eff is None:
+            QMessageBox.information(
+                self,
+                "Swatches",
+                "Preview a palette first, then you can adjust swatch colors.",
+            )
+            return
+        r, g, b = eff.colors.get(key, (128, 128, 128))
+        initial = QColor(r, g, b)
+        chosen = QColorDialog.getColor(initial, self, f"Choose color — {key}")
+        if not chosen.isValid():
+            return
+        self._swatch_overrides[key] = (chosen.red(), chosen.green(), chosen.blue())
+        self._update_palette_swatches()
+        self._append_log(f"Swatch override {key}={rgb_to_hex(self._swatch_overrides[key])}")
+
+    def _on_swatch_context_menu(self, key: str, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        reset_one = menu.addAction(f"Reset “{key}” to generated")
+        chosen = menu.exec(global_pos)
+        if chosen is reset_one and key in self._swatch_overrides:
+            del self._swatch_overrides[key]
+            self._update_palette_swatches()
+            self._append_log(f"Swatch {key} reset to generated palette.")
+
+    def _on_reset_swatches(self) -> None:
+        if not self._swatch_overrides:
+            return
+        self._swatch_overrides.clear()
+        if self._last_palette is not None:
+            self._update_palette_swatches(self._last_palette)
+        else:
+            self._clear_swatches()
+        self._append_log("All swatch overrides cleared.")
 
     def _set_color_tab_busy(self, running: bool) -> None:
         self._preview_btn.setEnabled(not running)
@@ -373,6 +455,7 @@ class MainWindow(QMainWindow):
         if not isinstance(pal, MaterialPalette):
             self._append_log("Preview finished with unexpected payload.")
             return
+        self._swatch_overrides.clear()
         self._last_palette = pal
         self._update_palette_swatches(pal)
         pri = pal.colors.get("primary", (0, 0, 0))
@@ -413,10 +496,13 @@ class MainWindow(QMainWindow):
         busy.show()
         self._busy = busy
 
+        assert self._last_palette is not None
+        pal_apply = merge_palette_color_overrides(self._last_palette, self._swatch_overrides)
+
         thread = QThread(self)
         worker = ApplyPaletteWorker(
             src_path=src,
-            palette=self._last_palette,
+            palette=pal_apply,
             choices=self._scheme_choices(),
         )
         self._thread = thread
@@ -472,6 +558,7 @@ class MainWindow(QMainWindow):
             dark=self._dark_choice(),
             quality=self._quality.value(),
             choices=self._scheme_choices(),
+            swatch_overrides=dict(self._swatch_overrides),
         )
         # CRITICAL: keep strong references to BOTH thread and worker. Without
         # self._worker, the local `worker` is garbage-collected the moment
@@ -505,6 +592,7 @@ class MainWindow(QMainWindow):
         self._close_busy()
         result: WorkerResult = payload  # type: ignore[assignment]
         self._last_palette = result.palette
+        self._swatch_overrides.clear()
         self._path_display.setText(str(result.src))
         self._update_palette_swatches(result.palette)
         pri = result.palette.colors.get("primary", (0, 0, 0))
@@ -650,14 +738,15 @@ class MainWindow(QMainWindow):
         return wrap
 
     def _require_palette(self) -> MaterialPalette | None:
-        if self._last_palette is None:
+        pal = self._effective_palette()
+        if pal is None:
             QMessageBox.information(
                 self,
                 "Conky",
                 "Generate a palette on the Colorizer tab first.",
             )
             return None
-        return self._last_palette
+        return pal
 
     def _pick_conky_in(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Conky template", str(Path.home()))

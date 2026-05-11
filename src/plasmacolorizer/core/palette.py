@@ -22,6 +22,20 @@ class MaterialPalette:
     def get(self, name: str) -> tuple[int, int, int]:
         return self.colors[name]
 
+
+def merge_palette_color_overrides(
+    pal: MaterialPalette,
+    overrides: dict[str, tuple[int, int, int]] | None,
+) -> MaterialPalette:
+    """Return a palette copy with only known ``pal.colors`` keys replaced (manual swatches)."""
+    if not overrides:
+        return pal
+    colors = dict(pal.colors)
+    for key, rgb in overrides.items():
+        if key in colors:
+            colors[key] = (int(rgb[0]) & 255, int(rgb[1]) & 255, int(rgb[2]) & 255)
+    return MaterialPalette(is_dark=pal.is_dark, colors=colors)
+
     def as_flat_hex(self) -> dict[str, str]:
         out: dict[str, str] = {}
         for k, v in self.colors.items():
