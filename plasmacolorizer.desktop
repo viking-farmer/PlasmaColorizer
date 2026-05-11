@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PlasmaColorizer
+Comment=Material You color schemes for KDE Plasma from your wallpaper
+Exec=/home/aivanov/Projects/PlasmaColorizer/run.sh
+Icon=preferences-desktop-color
+Categories=Settings;DesktopSettings;Qt;
+Terminal=false
+StartupNotify=true
