@@ -221,25 +221,30 @@ class MainWindow(QMainWindow):
         pri = result.palette.colors.get("primary", (0, 0, 0))
         self._append_log(f"Done - primary ~ {rgb_to_hex(pri)}, dark={result.palette.is_dark}")
 
-        if result.apply_ok:
+        if result.apply_ok and not result.apply_error:
             msg = (
-                "Color scheme generated and applied to Plasma.\n\n"
-                "If the colors look unchanged, open:\n"
-                "System Settings -> Appearance -> Colors\n"
-                f"and select \"{plasma_scheme.SCHEME_FILE_STEM}\"."
+                "Color scheme generated and applied.\n\n"
+                "Existing apps may need to be reopened to pick up the new palette. "
+                "Plasma itself usually refreshes within a few seconds."
+            )
+            QMessageBox.information(self, "PlasmaColorizer", msg)
+        elif result.apply_ok and result.apply_error:
+            msg = (
+                f"Colors were written to ~/.config/kdeglobals and saved to:\n{result.scheme_path}\n\n"
+                f"{result.apply_error}\n\n"
+                "If the desktop does not refresh automatically, log out and back in, or run:\n"
+                "  kquitapp6 plasmashell && kstart plasmashell"
             )
             QMessageBox.information(self, "PlasmaColorizer", msg)
         else:
-            self._append_log(f"plasma-apply-colorscheme warning: {result.apply_error}")
+            self._append_log(f"Apply error: {result.apply_error}")
             msg = (
-                f"Scheme file written to:\n{result.scheme_path}\n\n"
-                "plasma-apply-colorscheme did not finish or returned an error.\n\n"
-                "Apply it manually in a terminal:\n"
-                f"  plasma-apply-colorscheme {plasma_scheme.SCHEME_FILE_STEM}\n\n"
-                "Or open System Settings -> Appearance -> Colors\n"
-                f"and pick \"{plasma_scheme.SCHEME_FILE_STEM}\"."
+                f"Scheme file was written to:\n{result.scheme_path}\n\n"
+                f"But the colors could not be written to ~/.config/kdeglobals:\n{result.apply_error}\n\n"
+                "Open System Settings -> Appearance -> Colors and pick "
+                f"\"{plasma_scheme.SCHEME_FILE_STEM}\" manually."
             )
-            QMessageBox.warning(self, "PlasmaColorizer - manual apply needed", msg)
+            QMessageBox.warning(self, "PlasmaColorizer", msg)
 
     def _on_worker_failed(self, message: str) -> None:
         self._close_busy()

@@ -75,17 +75,25 @@ class GenerateSchemeWorker(QObject):
             written = plasma_scheme.write_scheme_file(body)
             self.progress.emit(f"Scheme written → {written}")
 
-            # ── Step 5: apply (non-fatal) ─────────────────────────────
-            self.progress.emit("Running plasma-apply-colorscheme…")
+            # ── Step 5: write to kdeglobals (this is what makes it active) ─
+            self.progress.emit("Writing color sections into ~/.config/kdeglobals…")
             apply_ok = True
             apply_error = ""
             try:
-                plasma_scheme.apply_scheme()
-                self.progress.emit("plasma-apply-colorscheme succeeded.")
+                kdg_path = plasma_scheme.apply_to_kdeglobals(mpl)
+                self.progress.emit(f"Updated {kdg_path}")
             except Exception as exc:  # noqa: BLE001
                 apply_ok = False
-                apply_error = str(exc)
-                self.progress.emit(f"Apply warning: {exc}")
+                apply_error = f"kdeglobals write failed: {exc}"
+                self.progress.emit(apply_error)
+
+            # ── Step 6: notify running apps (best effort, hard timeout) ────
+            self.progress.emit("Notifying running apps via DBus (2s timeout)…")
+            notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(timeout=2.0)
+            self.progress.emit(notify_msg)
+            if not notify_ok and apply_ok:
+                # not fatal — kdeglobals is already updated
+                apply_error = "Colors written, but running apps may not refresh until you restart Plasma or relog."
 
             self.finished.emit(WorkerResult(
                 src=src,
