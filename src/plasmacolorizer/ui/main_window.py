@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QSize, Qt, QThread
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
 
         self._last_palette: MaterialPalette | None = None
         self._thread: QThread | None = None
+        self._worker: GenerateSchemeWorker | None = None
         self._busy: QProgressDialog | None = None
 
         tabs = QTabWidget()
@@ -223,26 +225,40 @@ class MainWindow(QMainWindow):
         busy.show()
         self._busy = busy
 
-        thread = QThread()
+        thread = QThread(self)  # parented -> stays alive with MainWindow
         worker = GenerateSchemeWorker(
             src_path=src,
             green_strength=self._green_slider.value() / 100.0,
             dark=self._dark_choice(),
             quality=self._quality.value(),
         )
+        # CRITICAL: keep strong references to BOTH thread and worker. Without
+        # self._worker, the local `worker` is garbage-collected the moment
+        # _on_generate returns and thread.started fires a slot on a dead
+        # PyObject -> the worker never runs and the QThread stays alive
+        # forever, blocking app shutdown.
+        self._thread = thread
+        self._worker = worker
+
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._append_log, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
-        thread.finished.connect(lambda: self._apply_btn.setEnabled(True))
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_thread_finished)
 
-        self._thread = thread
         thread.start()
+
+    def _on_thread_finished(self) -> None:
+        self._apply_btn.setEnabled(True)
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+        if self._thread is not None:
+            self._thread.deleteLater()
+            self._thread = None
 
     def _on_worker_finished(self, payload: object) -> None:
         self._close_busy()
@@ -291,6 +307,21 @@ class MainWindow(QMainWindow):
         self._close_busy()
         self._append_log(f"Error: {message}")
         QMessageBox.critical(self, "PlasmaColorizer", message)
+
+    # ----------------------------------------------------------- shutdown
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
+        """Make sure background threads do not keep the process alive."""
+        thread = self._thread
+        if thread is not None and thread.isRunning():
+            self._logger.info("closeEvent: stopping worker thread")
+            thread.quit()
+            if not thread.wait(3000):
+                self._logger.warning("closeEvent: worker thread did not quit in 3s; terminating")
+                thread.terminate()
+                thread.wait(1000)
+        self._logger.info("closeEvent: accepting close")
+        super().closeEvent(event)
 
     # --- Conky tab -----------------------------------------------------
     def _build_conky_tab(self) -> QWidget:

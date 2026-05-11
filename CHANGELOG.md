@@ -27,6 +27,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   reply for `plasma-apply-colorscheme` is delayed.  We bypass that
   command entirely and write `~/.config/kdeglobals` directly, which is
   what `plasma-apply-colorscheme` does internally.
+- The background worker now actually runs.  The QThread / worker
+  objects were stored only in local variables in `_on_generate`, so
+  Python garbage-collected the worker before the thread's event loop
+  could call `worker.run()`.  We now keep strong references on the
+  `MainWindow` and parent the QThread to it.
+- The application now exits cleanly when its window is closed.  An
+  explicit `closeEvent` quits any still-running worker thread (3 s
+  grace period, then terminate), so the process no longer has to be
+  killed manually.
 
 ## [0.1.0] - 2026-05-10
 
