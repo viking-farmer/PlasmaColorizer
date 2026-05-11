@@ -259,13 +259,13 @@ def find_apply_colorscheme_executable() -> str:
     )
 
 
-def apply_scheme() -> None:
+def apply_scheme(timeout: int = 8) -> None:
     exe = find_apply_colorscheme_executable()
     proc = subprocess.run(
         [exe, SCHEME_FILE_STEM],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=timeout,
     )
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()

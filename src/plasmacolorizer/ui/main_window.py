@@ -30,7 +30,7 @@ from plasmacolorizer.conky.templating import context_from_palette, render_templa
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
-from plasmacolorizer.workers import GenerateSchemeWorker
+from plasmacolorizer.workers import GenerateSchemeWorker, WorkerResult
 
 
 class MainWindow(QMainWindow):
@@ -201,6 +201,7 @@ class MainWindow(QMainWindow):
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.progress.connect(self._append_log, Qt.ConnectionType.QueuedConnection)
         worker.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._on_worker_failed, Qt.ConnectionType.QueuedConnection)
         thread.finished.connect(lambda: self._apply_btn.setEnabled(True))
@@ -214,24 +215,31 @@ class MainWindow(QMainWindow):
 
     def _on_worker_finished(self, payload: object) -> None:
         self._close_busy()
-        src, mpl, written = payload  # type: ignore[misc]
-        self._last_palette = mpl
-        self._path_display.setText(str(src))
-        pri = mpl.colors.get("primary", (0, 0, 0))
-        self._append_log(f"Wrote color scheme file: {written}")
-        self._append_log(
-            f"Applied scheme “{plasma_scheme.SCHEME_FILE_STEM}” (primary ≈ {rgb_to_hex(pri)})"
-        )
-        scheme_hint = (
-            "If the desktop look barely changed, open "
-            "System Settings → Appearance → Colors and pick "
-            f"“{plasma_scheme.SCHEME_FILE_STEM}”."
-        )
-        QMessageBox.information(
-            self,
-            "PlasmaColorizer",
-            "Color scheme was generated and applied.\n\n" + scheme_hint,
-        )
+        result: WorkerResult = payload  # type: ignore[assignment]
+        self._last_palette = result.palette
+        self._path_display.setText(str(result.src))
+        pri = result.palette.colors.get("primary", (0, 0, 0))
+        self._append_log(f"Done - primary ~ {rgb_to_hex(pri)}, dark={result.palette.is_dark}")
+
+        if result.apply_ok:
+            msg = (
+                "Color scheme generated and applied to Plasma.\n\n"
+                "If the colors look unchanged, open:\n"
+                "System Settings -> Appearance -> Colors\n"
+                f"and select \"{plasma_scheme.SCHEME_FILE_STEM}\"."
+            )
+            QMessageBox.information(self, "PlasmaColorizer", msg)
+        else:
+            self._append_log(f"plasma-apply-colorscheme warning: {result.apply_error}")
+            msg = (
+                f"Scheme file written to:\n{result.scheme_path}\n\n"
+                "plasma-apply-colorscheme did not finish or returned an error.\n\n"
+                "Apply it manually in a terminal:\n"
+                f"  plasma-apply-colorscheme {plasma_scheme.SCHEME_FILE_STEM}\n\n"
+                "Or open System Settings -> Appearance -> Colors\n"
+                f"and pick \"{plasma_scheme.SCHEME_FILE_STEM}\"."
+            )
+            QMessageBox.warning(self, "PlasmaColorizer - manual apply needed", msg)
 
     def _on_worker_failed(self, message: str) -> None:
         self._close_busy()
