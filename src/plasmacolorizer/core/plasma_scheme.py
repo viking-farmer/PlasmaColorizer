@@ -260,14 +260,34 @@ def find_apply_colorscheme_executable() -> str:
 
 
 def apply_scheme(timeout: int = 8) -> None:
+    """
+    Apply the scheme via plasma-apply-colorscheme.
+
+    We redirect stdout/stderr to DEVNULL and kill the entire process group on
+    timeout.  capture_output=True would leave pipes open when child DBus
+    processes inherit them, making subprocess.communicate() block indefinitely
+    even after the parent is killed.
+    """
+    import signal
+
     exe = find_apply_colorscheme_executable()
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [exe, SCHEME_FILE_STEM],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,   # own process group → we can kill all of it
     )
-    if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip()
-        base = f"{exe} failed (exit {proc.returncode})"
-        raise RuntimeError(f"{base}: {tail}" if tail else base)
+    try:
+        retcode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(
+            f"{exe} did not finish within {timeout}s and was killed. "
+            "Apply manually: plasma-apply-colorscheme PlasmaColorizer"
+        )
+
+    if retcode != 0:
+        raise RuntimeError(f"{exe} exited with code {retcode}")
