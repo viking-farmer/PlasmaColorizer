@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 from plasmacolorizer.conky.templating import context_from_palette, render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
+from plasmacolorizer.core.logger import get_logger, log_file_path
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
 from plasmacolorizer.workers import GenerateSchemeWorker, WorkerResult
 
@@ -38,6 +39,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("PlasmaColorizer")
         self.resize(QSize(900, 640))
+
+        self._log_file = log_file_path()
+        self._logger = get_logger()
+        self._logger.info("MainWindow started; log file: %s", self._log_file)
 
         self._last_palette: MaterialPalette | None = None
         self._thread: QThread | None = None
@@ -135,9 +140,9 @@ class MainWindow(QMainWindow):
 
         self._append_log(
             "Ready.\n"
-            "• Use “Detect” to read the wallpaper path from Plasma (optional if you set Override).\n"
-            "• Use “Generate and apply scheme” to extract colors and apply them to Plasma — "
-            "this is the step that changes your desktop palette."
+            "  - Use Detect to read the wallpaper path from Plasma (optional if you set Override).\n"
+            "  - Use Generate and apply scheme to extract colors and apply them to Plasma.\n"
+            f"  - A detailed log is written to {self._log_file}"
         )
         return outer
 
@@ -147,6 +152,31 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, msg: str) -> None:
         self._log.append(msg)
+        self._logger.info(msg)
+
+    def _resolve_wallpaper_path(self) -> str | None:
+        """Resolve the image path on the main thread (DBus must not run on worker thread)."""
+        manual = self._manual_path.text().strip()
+        if manual:
+            if not Path(manual).is_file():
+                QMessageBox.warning(self, "Wallpaper", f"Override path not found: {manual}")
+                return None
+            return manual
+
+        existing = self._path_display.text().strip()
+        if existing and Path(existing).is_file():
+            return existing
+
+        try:
+            return wp.current_wallpaper_image_path(self._monitor.value())
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Wallpaper",
+                f"Could not detect wallpaper via Plasma DBus.\n\n{exc}\n\n"
+                "Set the Override field to an explicit image path and try again.",
+            )
+            return None
 
     def _on_detect_wallpaper(self) -> None:
         try:
@@ -154,7 +184,7 @@ class MainWindow(QMainWindow):
             self._path_display.setText(path)
             self._append_log(f"Detected wallpaper file: {path}")
             self._append_log(
-                "Next: click “Generate and apply scheme” to build a palette from this image and apply it in Plasma."
+                "Next: click Generate and apply scheme to build a palette from this image."
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Wallpaper", str(exc))
@@ -171,30 +201,31 @@ class MainWindow(QMainWindow):
             self._append_log("Already running.")
             return
 
-        manual = self._manual_path.text().strip() or None
+        src = self._resolve_wallpaper_path()
+        if src is None:
+            return
+        self._path_display.setText(src)
+
         self._apply_btn.setEnabled(False)
-        self._append_log(
-            "Generating… (quantize wallpaper → Material You palette → write .colors → plasma-apply-colorscheme)"
-        )
+        self._append_log("Generating: quantize, build palette, write .colors, update kdeglobals.")
 
         busy = QProgressDialog(self)
         busy.setWindowTitle("PlasmaColorizer")
         busy.setLabelText(
-            "Computing palette and applying to Plasma…\n(This may take a few seconds on large images.)"
+            "Computing palette and applying to Plasma.\n"
+            "This usually takes a few seconds; large wallpapers can take longer."
         )
         busy.setRange(0, 0)
         busy.setMinimumDuration(0)
-        busy.setModal(True)
-        # PyQt6 exposes setCancelButton (no cancelButton()); None removes the Cancel action.
+        busy.setModal(False)  # non-modal: keep the log visible and responsive
         busy.setCancelButton(None)
-        busy.setMinimumWidth(420)
+        busy.setMinimumWidth(440)
         busy.show()
         self._busy = busy
 
         thread = QThread()
         worker = GenerateSchemeWorker(
-            monitor=self._monitor.value(),
-            manual_path=manual,
+            src_path=src,
             green_strength=self._green_slider.value() / 100.0,
             dark=self._dark_choice(),
             quality=self._quality.value(),
@@ -219,32 +250,42 @@ class MainWindow(QMainWindow):
         self._last_palette = result.palette
         self._path_display.setText(str(result.src))
         pri = result.palette.colors.get("primary", (0, 0, 0))
-        self._append_log(f"Done - primary ~ {rgb_to_hex(pri)}, dark={result.palette.is_dark}")
+        self._append_log(f"Palette ready: primary={rgb_to_hex(pri)}, dark={result.palette.is_dark}")
 
-        if result.apply_ok and not result.apply_error:
-            msg = (
+        if not result.apply_ok:
+            self._append_log(f"Apply error: {result.apply_error}")
+            QMessageBox.warning(
+                self,
+                "PlasmaColorizer",
+                f"Scheme file was written to:\n{result.scheme_path}\n\n"
+                f"But colors could not be written to ~/.config/kdeglobals:\n{result.apply_error}\n\n"
+                "Open System Settings -> Appearance -> Colors and pick "
+                f"\"{plasma_scheme.SCHEME_FILE_STEM}\" manually.",
+            )
+            return
+
+        # kdeglobals write succeeded; now nudge running apps from the main thread.
+        self._append_log("Notifying running apps over DBus (2s timeout)...")
+        notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(timeout=2.0)
+        self._append_log(notify_msg)
+
+        if notify_ok:
+            QMessageBox.information(
+                self,
+                "PlasmaColorizer",
                 "Color scheme generated and applied.\n\n"
                 "Existing apps may need to be reopened to pick up the new palette. "
-                "Plasma itself usually refreshes within a few seconds."
+                "Plasma itself usually refreshes within a few seconds.",
             )
-            QMessageBox.information(self, "PlasmaColorizer", msg)
-        elif result.apply_ok and result.apply_error:
-            msg = (
-                f"Colors were written to ~/.config/kdeglobals and saved to:\n{result.scheme_path}\n\n"
-                f"{result.apply_error}\n\n"
-                "If the desktop does not refresh automatically, log out and back in, or run:\n"
-                "  kquitapp6 plasmashell && kstart plasmashell"
-            )
-            QMessageBox.information(self, "PlasmaColorizer", msg)
         else:
-            self._append_log(f"Apply error: {result.apply_error}")
-            msg = (
-                f"Scheme file was written to:\n{result.scheme_path}\n\n"
-                f"But the colors could not be written to ~/.config/kdeglobals:\n{result.apply_error}\n\n"
-                "Open System Settings -> Appearance -> Colors and pick "
-                f"\"{plasma_scheme.SCHEME_FILE_STEM}\" manually."
+            QMessageBox.information(
+                self,
+                "PlasmaColorizer",
+                f"Colors saved to:\n{result.kdeglobals_path}\n\n"
+                "DBus refresh did not respond, so running apps may not update until you log out "
+                "and back in, or run:\n\n"
+                "  kquitapp6 plasmashell && kstart plasmashell",
             )
-            QMessageBox.warning(self, "PlasmaColorizer", msg)
 
     def _on_worker_failed(self, message: str) -> None:
         self._close_busy()
