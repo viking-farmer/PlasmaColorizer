@@ -23,6 +23,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   responsive while work is in progress.
 
 ### Fixed
+- Plasma 6: session bus has no ``org.kde.KGlobalSettings`` (always
+  ``ServiceUnknown``).  Palette refresh now calls ``org.kde.KWin.reconfigure``
+  and ``org.kde.PlasmaShell.refreshCurrentShell`` instead.
+- When ``[General]`` had ``accentColorFromWallpaper=true``, Plasma kept
+  overriding accent colors from the wallpaper so the generated scheme looked
+  unchanged.  We now set ``accentColorFromWallpaper=false``, sync
+  ``AccentColor`` to the Material primary, and update ``ColorSchemeHash`` to
+  the SHA-1 of the written ``.colors`` file.
+- Progress log lines were duplicated (worker + GUI both logged the same
+  message); worker progress now only emits the signal.
 - Generate and apply no longer hangs on systems where Plasma's DBus
   reply for `plasma-apply-colorscheme` is delayed.  We bypass that
   command entirely and write `~/.config/kdeglobals` directly, which is

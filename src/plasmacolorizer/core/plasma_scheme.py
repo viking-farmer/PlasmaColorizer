@@ -1,22 +1,24 @@
 """Generate Plasma `.colors` files and apply them to the running session.
 
 Applying is done by:
-  1. writing the `.colors` file to ~/.local/share/color-schemes/
-  2. writing the same color sections (and `General/ColorScheme`) directly
-     into ~/.config/kdeglobals
-  3. emitting `org.kde.KGlobalSettings.notifyChange` on the session bus to
-     refresh running apps (best-effort, with a timeout)
+  1. writing the ``.colors`` file to ``~/.local/share/color-schemes/``
+  2. writing the same color sections (and ``[General]`` keys) directly into
+     ``~/.config/kdeglobals``, including ``ColorSchemeHash`` (SHA-1 of the
+     scheme file) and disabling ``accentColorFromWallpaper`` so Plasma does
+     not keep overriding accents from the wallpaper.
+  3. calling ``org.kde.KWin.reconfigure`` and ``org.kde.PlasmaShell.refreshCurrentShell``
+     on the session bus (Plasma 6 does not ship ``org.kde.KGlobalSettings``).
 
-We deliberately do NOT invoke `plasma-apply-colorscheme` — it has been known
+We deliberately do NOT invoke ``plasma-apply-colorscheme`` — it has been known
 to hang for tens of seconds (or forever) when its DBus call to plasmashell
-does not return, and it offers nothing we cannot do ourselves in-process.
+does not return.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import textwrap
-import threading
 from pathlib import Path
 
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
@@ -297,12 +299,58 @@ def _set_general_color_scheme(text: str, scheme_name: str) -> str:
     return text + f"[General]\n{new_cs}"
 
 
+def _set_general_kv(text: str, key: str, value: str) -> str:
+    """Insert or replace ``key=value`` inside ``[General]`` (case-sensitive key)."""
+    lines = text.splitlines(keepends=True)
+    in_general = False
+    general_start = -1
+    general_end = len(lines)
+    key_index = -1
+    prefix = f"{key}="
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if stripped == "[General]":
+                in_general = True
+                general_start = i
+                continue
+            elif in_general:
+                general_end = i
+                break
+        if in_general and stripped.startswith(prefix):
+            key_index = i
+            break
+
+    new_line = f"{key}={value}\n"
+    if key_index != -1:
+        lines[key_index] = new_line
+        return "".join(lines)
+
+    if general_start != -1:
+        insert_at = general_start + 1
+        return "".join(lines[:insert_at]) + new_line + "".join(lines[insert_at:])
+
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + f"[General]\n{new_line}"
+
+
 def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
-    """Write Material palette sections + General/ColorScheme into ~/.config/kdeglobals."""
+    """Write Material palette sections + ``[General]`` keys into ``~/.config/kdeglobals``."""
     sections = build_color_sections(pal)
 
     text = _read_kdeglobals_text()
     text = _set_general_color_scheme(text, SCHEME_FILE_STEM)
+
+    scheme_path = scheme_file_path()
+    if scheme_path.is_file():
+        digest = hashlib.sha1(scheme_path.read_bytes()).hexdigest()
+        text = _set_general_kv(text, "ColorSchemeHash", digest)
+
+    pri = pal.colors["primary"]
+    text = _set_general_kv(text, "AccentColor", f"{pri[0]},{pri[1]},{pri[2]}")
+    text = _set_general_kv(text, "accentColorFromWallpaper", "false")
 
     for section_name, rows in sections.items():
         body = _serialize_section(section_name, rows)
@@ -318,32 +366,43 @@ def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
 
 def notify_kde_palette_change(timeout: float = 2.0) -> tuple[bool, str]:
     """
-    Ping KDE so running apps refresh their palette without relogin.
+    Ask KWin and PlasmaShell to reload configuration after ``kdeglobals`` changed.
 
-    Runs the DBus call in a worker thread with `timeout` seconds; if it
-    doesn't return in time we bail out cleanly so the UI does not hang.
+    ``org.kde.KGlobalSettings`` is not an activatable session service on
+    Plasma 6 (Wayland), so the old ``notifyChange`` call always failed with
+    ``ServiceUnknown``.  ``org.kde.KWin`` exposes ``reconfigure`` (no-reply) and
+    ``org.kde.plasmashell`` exposes ``refreshCurrentShell`` — both return
+    quickly when called from the GUI thread.
+
+    The ``timeout`` parameter is kept for API compatibility; it is unused.
     """
-    result: dict[str, object] = {"ok": False, "msg": ""}
+    del timeout  # API compat; calls are synchronous and expected to be fast
+    parts: list[str] = []
+    ok_any = False
+    try:
+        import dbus  # type: ignore
 
-    def worker() -> None:
-        try:
-            import dbus  # type: ignore
-            bus = dbus.SessionBus()
-            obj = bus.get_object("org.kde.KGlobalSettings", "/KGlobalSettings")
-            iface = dbus.Interface(obj, "org.kde.KGlobalSettings")
-            # PaletteChanged = 0, SettingsChanged = 0
-            iface.notifyChange(0, 0)
-            result["ok"] = True
-            result["msg"] = "DBus notify sent."
-        except Exception as exc:  # noqa: BLE001
-            result["msg"] = f"DBus notify skipped: {exc}"
+        bus = dbus.SessionBus()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"DBus session bus unavailable: {exc}"
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return False, f"DBus notify timed out after {timeout:.1f}s (ignored)"
-    return bool(result["ok"]), str(result["msg"])
+    try:
+        kwin = bus.get_object("org.kde.KWin", "/KWin")
+        dbus.Interface(kwin, "org.kde.KWin").reconfigure()
+        parts.append("KWin.reconfigure OK")
+        ok_any = True
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"KWin.reconfigure: {exc}")
+
+    try:
+        shell = bus.get_object("org.kde.plasmashell", "/PlasmaShell")
+        dbus.Interface(shell, "org.kde.PlasmaShell").refreshCurrentShell()
+        parts.append("PlasmaShell.refreshCurrentShell OK")
+        ok_any = True
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"PlasmaShell.refreshCurrentShell: {exc}")
+
+    return ok_any, "; ".join(parts)
 
 
 def apply_scheme() -> Path:

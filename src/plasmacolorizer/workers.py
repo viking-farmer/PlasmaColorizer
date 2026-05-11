@@ -63,7 +63,8 @@ class GenerateSchemeWorker(QObject):
     # ------------------------------------------------------------------ utils
 
     def _emit(self, msg: str) -> None:
-        self._log.info(msg)
+        # Log only on the GUI thread via progress -> MainWindow._append_log to
+        # avoid duplicate file lines (same message from two thread IDs).
         self.progress.emit(msg)
 
     # ----------------------------------------------------------------- run()
