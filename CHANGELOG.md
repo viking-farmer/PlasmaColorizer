@@ -10,6 +10,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - File-based logger at `~/.cache/plasmacolorizer/log.txt` with timestamps,
   PID, and thread IDs. Visible to the user from the in-app log too.
 - `CHANGELOG.md` and conventional-commit policy.
+- Optional **Restart Plasma shell** checkbox (on by default): runs
+  ``kquitapp6 plasmashell`` then ``kstart plasmashell`` so the task bar and
+  Kickoff fully reload cached colors.
+- After applying a palette, call **``org.kde.plasmashell.accentColor``**
+  ``setAccentColor`` so the global Plasma accent (used heavily by the panel
+  and launcher) matches the Material primary colour.
 
 ### Changed
 - The DBus session is now only touched from the GUI thread.  Wallpaper

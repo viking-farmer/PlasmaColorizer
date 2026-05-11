@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import subprocess
 import textwrap
 from pathlib import Path
 
-from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
+from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex, rgb_tuple_to_argb_u
 
 
 SCHEME_FILE_STEM = "PlasmaColorizer"
@@ -364,15 +366,18 @@ def apply_to_kdeglobals(pal: MaterialPalette) -> Path:
     return path
 
 
-def notify_kde_palette_change(timeout: float = 2.0) -> tuple[bool, str]:
+def notify_kde_palette_change(pal: MaterialPalette, *, timeout: float = 2.0) -> tuple[bool, str]:
     """
-    Ask KWin and PlasmaShell to reload configuration after ``kdeglobals`` changed.
+    Ask KWin, PlasmaShell, and the accent-color service to pick up ``kdeglobals``.
 
     ``org.kde.KGlobalSettings`` is not an activatable session service on
-    Plasma 6 (Wayland), so the old ``notifyChange`` call always failed with
-    ``ServiceUnknown``.  ``org.kde.KWin`` exposes ``reconfigure`` (no-reply) and
-    ``org.kde.plasmashell`` exposes ``refreshCurrentShell`` — both return
-    quickly when called from the GUI thread.
+    Plasma 6 (Wayland).  We instead:
+
+    * ``org.kde.KWin`` → ``reconfigure()`` (window chrome / compositor hints)
+    * ``org.kde.plasmashell`` → ``refreshCurrentShell()`` (lightweight shell refresh)
+    * ``org.kde.plasmashell.accentColor`` → ``setAccentColor(u)`` — this updates
+      the **global Plasma accent** used by the panel, kickoff, and many shell
+      widgets (see ``kded6`` module ``plasma_accentcolor_service``).
 
     The ``timeout`` parameter is kept for API compatibility; it is unused.
     """
@@ -402,7 +407,62 @@ def notify_kde_palette_change(timeout: float = 2.0) -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         parts.append(f"PlasmaShell.refreshCurrentShell: {exc}")
 
+    try:
+        argb = rgb_tuple_to_argb_u(pal.colors["primary"])
+        ac = bus.get_object("org.kde.plasmashell.accentColor", "/AccentColor")
+        dbus.Interface(ac, "org.kde.plasmashell.accentColor").setAccentColor(dbus.UInt32(argb))
+        parts.append("plasmashell.accentColor.setAccentColor OK")
+        ok_any = True
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"plasmashell.accentColor.setAccentColor: {exc}")
+
     return ok_any, "; ".join(parts)
+
+
+def restart_plasmashell(*, quit_timeout_s: float = 25.0) -> tuple[bool, str]:
+    """
+    Fully restart ``plasmashell`` so panel and launcher pick up every color role.
+
+    ``refreshCurrentShell`` and accent updates help, but parts of the desktop
+    shell still cache QPalette / theme data until the process restarts.  This
+    matches what many KDE docs suggest when ``kdeglobals`` is edited by hand.
+
+    Uses ``kquitapp6 plasmashell`` (or ``kquitapp5``) then ``kstart plasmashell``.
+    There is a short desktop flicker while the shell comes back.
+    """
+    kquit = shutil.which("kquitapp6") or shutil.which("kquitapp5")
+    kstart = shutil.which("kstart")
+    if not kquit:
+        return False, "Neither kquitapp6 nor kquitapp5 was found in PATH."
+    if not kstart:
+        return False, "kstart was not found in PATH."
+
+    try:
+        proc = subprocess.run(
+            [kquit, "plasmashell"],
+            capture_output=True,
+            text=True,
+            timeout=quit_timeout_s,
+        )
+        err_tail = (proc.stderr or proc.stdout or "").strip()
+        if proc.returncode not in (0, 1):
+            # 1 can mean "not running" on some setups; still try kstart
+            if err_tail:
+                parts = f"kquitapp returned {proc.returncode}: {err_tail[:200]}"
+            else:
+                parts = f"kquitapp returned {proc.returncode}"
+        else:
+            parts = "kquitapp plasmashell OK"
+    except subprocess.TimeoutExpired:
+        return False, f"{kquit} plasmashell timed out after {quit_timeout_s:.0f}s."
+
+    subprocess.Popen(
+        [kstart, "plasmashell"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return True, f"{parts}; started plasmashell via {kstart}."
 
 
 def apply_scheme() -> Path:
@@ -418,5 +478,5 @@ def apply_scheme() -> Path:
     """
     raise NotImplementedError(
         "apply_scheme() needs a MaterialPalette; call apply_to_kdeglobals(palette) "
-        "and notify_kde_palette_change() instead."
+        "and notify_kde_palette_change(palette) instead."
     )

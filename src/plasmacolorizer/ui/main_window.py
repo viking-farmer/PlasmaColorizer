@@ -7,6 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import QSize, Qt, QThread
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -120,7 +121,7 @@ class MainWindow(QMainWindow):
         self._apply_btn = QPushButton("Generate and apply scheme")
         self._apply_btn.setToolTip(
             "Quantizes the image, runs Material You, writes ~/.local/share/color-schemes/PlasmaColorizer.colors, "
-            "then runs plasma-apply-colorscheme. This can take a few seconds."
+            "merges colors into ~/.config/kdeglobals, then refreshes KWin / PlasmaShell / global accent."
         )
         self._apply_btn.clicked.connect(self._on_generate)
         clear_manual = QPushButton("Clear override")
@@ -130,6 +131,17 @@ class MainWindow(QMainWindow):
         actions.addWidget(clear_manual)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        self._restart_plasma = QCheckBox(
+            "Restart Plasma shell afterward (panel & launcher fully match; brief desktop flicker)"
+        )
+        self._restart_plasma.setChecked(True)
+        self._restart_plasma.setToolTip(
+            "When checked, runs kquitapp6 plasmashell then kstart plasmashell so the task bar, "
+            "Kickoff, and other shell chrome reload every color from kdeglobals. "
+            "Uncheck if you only want a soft refresh (may leave some shell colors unchanged)."
+        )
+        layout.addWidget(self._restart_plasma)
 
         log_box = QGroupBox("Log")
         log_layout = QVBoxLayout()
@@ -280,26 +292,48 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # kdeglobals write succeeded; now nudge running apps from the main thread.
-        self._append_log("Notifying running apps over DBus (2s timeout)...")
-        notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(timeout=2.0)
+        # kdeglobals write succeeded; push palette to KWin, shell, and global accent (main thread).
+        self._append_log("DBus: KWin + PlasmaShell + plasmashell.accentColor…")
+        notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(result.palette, timeout=2.0)
         self._append_log(notify_msg)
 
-        if notify_ok:
+        restarted = False
+        if self._restart_plasma.isChecked():
+            self._append_log("Restarting plasmashell (full panel / launcher reload)…")
+            rs_ok, rs_msg = plasma_scheme.restart_plasmashell()
+            self._append_log(rs_msg)
+            restarted = rs_ok
+
+        if notify_ok and restarted:
             QMessageBox.information(
                 self,
                 "PlasmaColorizer",
-                "Color scheme generated and applied.\n\n"
-                "Existing apps may need to be reopened to pick up the new palette. "
-                "Plasma itself usually refreshes within a few seconds.",
+                "Color scheme applied, global accent updated, and Plasma shell was restarted.\n\n"
+                "The task bar and launcher should now follow the new palette.",
+            )
+        elif notify_ok:
+            QMessageBox.information(
+                self,
+                "PlasmaColorizer",
+                "Color scheme applied and the global Plasma accent was updated.\n\n"
+                "If the task bar or Kickoff still look unchanged, enable "
+                "\"Restart Plasma shell afterward\" and run again (or run manually:\n"
+                "  kquitapp6 plasmashell && kstart plasmashell\n).",
+            )
+        elif restarted:
+            QMessageBox.information(
+                self,
+                "PlasmaColorizer",
+                "Colors were saved to kdeglobals and plasmashell was restarted.\n\n"
+                "Some DBus refresh steps failed; check the log for details.",
             )
         else:
             QMessageBox.information(
                 self,
                 "PlasmaColorizer",
                 f"Colors saved to:\n{result.kdeglobals_path}\n\n"
-                "DBus refresh did not respond, so running apps may not update until you log out "
-                "and back in, or run:\n\n"
+                "DBus refresh and shell restart did not all succeed — see the log.\n\n"
+                "You can try manually:\n"
                 "  kquitapp6 plasmashell && kstart plasmashell",
             )
 

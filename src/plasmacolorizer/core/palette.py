@@ -38,6 +38,12 @@ def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def rgb_tuple_to_argb_u(rgb: tuple[int, int, int]) -> int:
+    """Pack opaque RGB into a 32-bit ``0xAARRGGBB`` value (DBus ``u`` / Qt-style)."""
+    r, g, b = rgb
+    return (255 << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
+
+
 def seed_color_from_image(path: str, quality: int = 4) -> int:
     """Return ARGB int suitable for Hct / dynamic scheme."""
     result = ImageQuantizeCelebi(path, max(1, int(quality)), 128)
