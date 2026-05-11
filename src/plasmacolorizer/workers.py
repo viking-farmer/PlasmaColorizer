@@ -13,6 +13,8 @@ Only deterministic, thread-safe work runs here:
   3. build a full Material You palette,
   4. write the ``.colors`` file under ``~/.local/share/color-schemes``,
   5. write color sections into ``~/.config/kdeglobals``.
+  6. write a minimal Plasma **desktop theme** under ``~/.local/share/plasma/desktoptheme/``
+     and set ``~/.config/plasmarc`` ``[Theme] name=`` so panel / Kickoff use the palette.
 """
 
 from __future__ import annotations
@@ -116,6 +118,20 @@ class GenerateSchemeWorker(QObject):
                 apply_error = f"kdeglobals write failed: {exc}"
                 log.exception("kdeglobals write failed")
                 self._emit(apply_error)
+
+            if apply_ok:
+                self._emit("Writing Plasma desktop theme (panel / Kickoff colours)…")
+                try:
+                    theme_root = plasma_scheme.write_plasma_desktop_theme(mpl)
+                    self._emit(f"Desktop theme: {theme_root}")
+                    prc = plasma_scheme.merge_user_plasmarc_select_desktop_theme()
+                    self._emit(
+                        f"plasmarc → [Theme] name={plasma_scheme.DESKTOP_THEME_ID} ({prc})"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    warn = f"Desktop theme / plasmarc step failed (Qt apps still updated): {exc}"
+                    log.exception("plasma desktop theme failed")
+                    self._emit(warn)
 
             self._emit("Worker finished")
             self.finished.emit(WorkerResult(

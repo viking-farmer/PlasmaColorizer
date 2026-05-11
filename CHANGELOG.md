@@ -16,6 +16,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - After applying a palette, call **``org.kde.plasmashell.accentColor``**
   ``setAccentColor`` so the global Plasma accent (used heavily by the panel
   and launcher) matches the Material primary colour.
+- Install a **Plasma desktop theme** under
+  ``~/.local/share/plasma/desktoptheme/PlasmaColorizer/`` (``colors`` +
+  ``metadata.json`` + ``plasmarc`` with ``FallbackTheme``) and set
+  ``~/.config/plasmarc`` ``[Theme] name=PlasmaColorizer``, because the task bar
+  and Kickoff read shell colours from the active **Plasma Style**, not only from
+  ``kdeglobals``.
 
 ### Changed
 - The DBus session is now only touched from the GUI thread.  Wallpaper

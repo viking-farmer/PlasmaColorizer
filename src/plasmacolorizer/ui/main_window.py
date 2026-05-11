@@ -133,13 +133,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
 
         self._restart_plasma = QCheckBox(
-            "Restart Plasma shell afterward (panel & launcher fully match; brief desktop flicker)"
+            "Restart Plasma shell afterward (required once after first apply; brief flicker)"
         )
         self._restart_plasma.setChecked(True)
         self._restart_plasma.setToolTip(
-            "When checked, runs kquitapp6 plasmashell then kstart plasmashell so the task bar, "
-            "Kickoff, and other shell chrome reload every color from kdeglobals. "
-            "Uncheck if you only want a soft refresh (may leave some shell colors unchanged)."
+            "Plasma panel and Kickoff read colours from the active Plasma **desktop theme** "
+            "(see ~/.local/share/plasma/desktoptheme/). After generating a theme, "
+            "kquitapp6 plasmashell + kstart plasmashell reloads that cache. "
+            "Leave this checked unless you know you do not need a full shell restart."
         )
         layout.addWidget(self._restart_plasma)
 
