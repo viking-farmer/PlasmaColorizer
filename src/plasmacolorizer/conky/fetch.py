@@ -8,9 +8,15 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_settings
+from plasmacolorizer.conky.settings_store import load_conky_settings
+
+# Open-Meteo asks for a descriptive User-Agent; bare urllib defaults may get empty responses.
+_DEFAULT_UA = (
+    "PlasmaColorizer/0.1 (+https://github.com/viking-farmer/PlasmaColorizer; conky weather)"
+)
 
 # Short references rotated by calendar day (ESV API passage/text).
 _DAILY_PASSAGES: tuple[str, ...] = (
@@ -56,6 +62,15 @@ _DAILY_PASSAGES: tuple[str, ...] = (
     "Revelation 21:4",
 )
 
+@dataclass(frozen=True)
+class GeocodeHit:
+    """One row from Open-Meteo's geocoding API (or a bundled preset)."""
+
+    label: str
+    latitude: float
+    longitude: float
+
+
 _WMO_LABEL: dict[int, str] = {
     0: "Clear",
     1: "Mainly clear",
@@ -80,16 +95,54 @@ _WMO_LABEL: dict[int, str] = {
     99: "Thunderstorm",
 }
 
+# WMO weather codes → emoji (https://open-meteo.com/en/docs)
+_WMO_EMOJI: dict[int, str] = {
+    0: "☀️",
+    1: "🌤️",
+    2: "⛅",
+    3: "☁️",
+    45: "🌫️",
+    48: "🌫️",
+    51: "🌦️",
+    53: "🌦️",
+    55: "🌦️",
+    61: "🌧️",
+    63: "🌧️",
+    65: "🌧️",
+    71: "❄️",
+    73: "❄️",
+    75: "❄️",
+    80: "🌧️",
+    81: "🌧️",
+    82: "🌧️",
+    95: "⛈️",
+    96: "⛈️",
+    99: "⛈️",
+}
+
+
+def _weather_emoji(code_i: int | None) -> str:
+    if code_i is None:
+        return "🌡️"
+    return _WMO_EMOJI.get(code_i, "🌤️")
+
+
+def _merge_headers(extra: dict[str, str] | None) -> dict[str, str]:
+    h = {"User-Agent": _DEFAULT_UA}
+    if extra:
+        h.update(extra)
+    return h
+
 
 def _http_get_json(url: str, headers: dict[str, str] | None = None, timeout: float = 20.0) -> object:
-    req = urllib.request.Request(url, headers=headers or {})
+    req = urllib.request.Request(url, headers=_merge_headers(headers))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     return json.loads(raw)
 
 
 def _http_get_text(url: str, headers: dict[str, str] | None = None, timeout: float = 20.0) -> str:
-    req = urllib.request.Request(url, headers=headers or {})
+    req = urllib.request.Request(url, headers=_merge_headers(headers))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
@@ -129,51 +182,88 @@ def fetch_esv_line() -> str:
     return one
 
 
-def _geocode_city(city: str) -> tuple[float, float] | None:
-    city = city.strip()
-    if not city:
-        return None
-    q = urllib.parse.urlencode({"name": city, "count": "1", "language": "en", "format": "json"})
+def _format_geocode_row(row: dict) -> str:
+    name = row.get("name")
+    if not name:
+        return "?"
+    country = row.get("country") or ""
+    admin1 = row.get("admin1") or ""
+    tail_bits = [x for x in (admin1, country) if x]
+    tail = ", ".join(tail_bits)
+    return f"{name}, {tail}" if tail else str(name)
+
+
+def geocode_search(query: str, *, limit: int = 15) -> list[GeocodeHit]:
+    """Search locations via ``https://geocoding-api.open-meteo.com`` (same index the site uses)."""
+    query = query.strip()
+    if not query:
+        return []
+    q = urllib.parse.urlencode(
+        {"name": query, "count": str(limit), "language": "en", "format": "json"}
+    )
     url = f"https://geocoding-api.open-meteo.com/v1/search?{q}"
     try:
         data = _http_get_json(url)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
+        return []
+    if not isinstance(data, dict) or data.get("error") is True:
+        return []
     results = data.get("results")
     if not results or not isinstance(results, list):
-        return None
-    first = results[0]
-    if not isinstance(first, dict):
-        return None
-    lat, lon = first.get("latitude"), first.get("longitude")
-    if lat is None or lon is None:
-        return None
-    try:
-        return float(lat), float(lon)
-    except (TypeError, ValueError):
-        return None
+        return []
+    out: list[GeocodeHit] = []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        lat, lon = row.get("latitude"), row.get("longitude")
+        if lat is None or lon is None:
+            continue
+        try:
+            out.append(
+                GeocodeHit(
+                    label=_format_geocode_row(row),
+                    latitude=float(lat),
+                    longitude=float(lon),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
-def _resolve_lat_lon(settings: ConkySettings) -> tuple[float, float] | None:
-    if settings.weather_lat is not None and settings.weather_lon is not None:
-        return float(settings.weather_lat), float(settings.weather_lon)
-    return _geocode_city(settings.weather_city)
+def _geocode_city(city: str) -> tuple[float, float] | None:
+    hits = geocode_search(city, limit=10)
+    if not hits:
+        return None
+    h = hits[0]
+    return h.latitude, h.longitude
 
 
 def fetch_weather_line() -> str:
     settings = load_conky_settings()
-    coords = _resolve_lat_lon(settings)
-    if coords is None:
-        return "Set city or lat/lon in PlasmaColorizer → Conky."
-    lat, lon = coords
+    city = (settings.weather_city or "").strip()
+
+    if settings.weather_lat is not None and settings.weather_lon is not None:
+        lat, lon = float(settings.weather_lat), float(settings.weather_lon)
+    elif city:
+        coords = _geocode_city(city)
+        if coords is None:
+            return (
+                f'Weather: no match for “{city}”. Save Conky settings, check spelling, '
+                "or set lat/lon."
+            )
+        lat, lon = coords
+    else:
+        return "Set city or lat/lon in PlasmaColorizer → Conky (then Save)."
+    use_f = bool(settings.weather_fahrenheit)
+    temp_unit = "fahrenheit" if use_f else "celsius"
     params = urllib.parse.urlencode(
         {
             "latitude": lat,
             "longitude": lon,
             "current": "temperature_2m,weather_code",
             "timezone": "auto",
+            "temperature_unit": temp_unit,
         }
     )
     url = f"https://api.open-meteo.com/v1/forecast?{params}"
@@ -189,14 +279,20 @@ def fetch_weather_line() -> str:
         return "Weather: no current"
     temp = cur.get("temperature_2m")
     code = cur.get("weather_code")
-    label = _WMO_LABEL.get(int(code), "—") if code is not None else "—"
+    try:
+        code_i = int(code) if code is not None and code != "" else None
+    except (TypeError, ValueError):
+        code_i = None
+    label = _WMO_LABEL.get(code_i, "—") if code_i is not None else "—"
+    emoji = _weather_emoji(code_i)
+    deg = "°F" if use_f else "°C"
     try:
         t = float(temp) if temp is not None else float("nan")
     except (TypeError, ValueError):
         t = float("nan")
     if t != t:  # NaN
-        return f"{label}"
-    return f"{t:.0f}°C  {label}"
+        return f"{emoji}  {label}"
+    return f"{emoji}  {t:.0f}{deg}  {label}"
 
 
 def main(argv: list[str] | None = None) -> int:

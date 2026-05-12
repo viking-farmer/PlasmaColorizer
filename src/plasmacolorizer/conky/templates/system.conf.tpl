@@ -1,18 +1,17 @@
 -- PlasmaColorizer preset: system stats (CPU, memory, disk, network)
 -- Colors follow wallpaper palette via {{token}} substitution.
--- Semi-opaque panel (ARGB) avoids broken transparency when windows cross the Conky region.
+-- Opaque dock panel; “opacity” is blended RGB (no ARGB — avoids KWin blur ghosts after overlaps).
 
 conky.config = {
-    alignment = 'top_left',
+    alignment = '{{conky_alignment}}',
     gap_x = 24,
     gap_y = 48,
-    minimum_width = 220,
+    minimum_width = {{system_min_width}},
     own_window = true,
-    own_window_type = 'desktop',
+    own_window_type = 'dock',
     own_window_transparent = false,
     own_window_colour = '{{panel_bg_hex6}}',
-    own_window_argb_visual = true,
-    own_window_argb_value = {{conky_window_alpha}},
+    own_window_argb_visual = false,
     own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
     own_window_title = 'PlasmaColorizer_system',
     double_buffer = true,
@@ -29,10 +28,7 @@ conky.config = {
 
 conky.text = [[
 ${color1}System${font sans:size=8}${color2}${hr 1}${font}
-${color1}CPU${alignr}${cpu cpu0}%
-${color1}Load${alignr}${loadavg 1}
-${color1}RAM${alignr}${mem} / ${memmax}
-${color1}RAM %${alignr}${memperc}%
+{{system_stats_body}}
 ${color1}Root free${alignr}${fs_free /}
 ${color1}Root used${alignr}${fs_used /} / ${fs_size /}
 ${color1}Net${font sans:size=8}${color2}${hr 1}${font}

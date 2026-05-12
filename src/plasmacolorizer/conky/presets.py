@@ -12,12 +12,9 @@ from importlib import resources
 from pathlib import Path
 from shutil import which
 
+from plasmacolorizer.conky.settings_store import load_conky_settings
 from plasmacolorizer.conky.templating import context_from_palette, render_template
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
-
-# Whole-window alpha for ARGB Conky windows (~75% opaque / 25% transparent).
-_CONKY_WINDOW_ALPHA = str(round(0.75 * 255))
-
 
 @dataclass(frozen=True)
 class PresetMeta:
@@ -54,6 +51,43 @@ PRESETS: dict[str, PresetMeta] = {
     ),
 }
 
+# Conky ``alignment`` (3×3 grid). Labels are for the UI; values match Conky’s config.
+CONKY_GRID_ALIGNMENTS: tuple[tuple[str, str], ...] = (
+    ("top_left", "Top left"),
+    ("top_middle", "Top center"),
+    ("top_right", "Top right"),
+    ("middle_left", "Middle left"),
+    ("middle_middle", "Center"),
+    ("middle_right", "Middle right"),
+    ("bottom_left", "Bottom left"),
+    ("bottom_middle", "Bottom center"),
+    ("bottom_right", "Bottom right"),
+)
+
+_CONKY_ALIGNMENT_IDS: frozenset[str] = frozenset(a for a, _ in CONKY_GRID_ALIGNMENTS)
+
+_DEFAULT_ALIGNMENT_FOR_PRESET: dict[str, str] = {
+    "system": "top_left",
+    "shortcuts": "top_right",
+    "verse": "bottom_left",
+    "weather": "bottom_right",
+}
+
+
+def default_alignment_for_preset(preset_id: str) -> str:
+    """Original corner defaults for each bundled preset (before user overrides)."""
+    return _DEFAULT_ALIGNMENT_FOR_PRESET.get(preset_id, "top_left")
+
+
+def alignment_for_preset(preset_id: str) -> str:
+    """Effective alignment: saved setting if valid, else bundled default."""
+    if preset_id not in PRESETS:
+        return "top_left"
+    stored = (load_conky_settings().conky_preset_positions.get(preset_id) or "").strip()
+    if stored in _CONKY_ALIGNMENT_IDS:
+        return stored
+    return default_alignment_for_preset(preset_id)
+
 
 def rendered_dir() -> Path:
     return Path(os.path.expanduser("~/.local/share/plasmacolorizer/conky/rendered"))
@@ -75,14 +109,79 @@ def load_preset_template(preset_id: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def build_render_context(pal: MaterialPalette) -> dict[str, str]:
+def _hex6(pal: MaterialPalette, key: str, default: tuple[int, int, int]) -> str:
+    return rgb_to_hex(pal.colors.get(key, default)).lstrip("#")
+
+
+# Neutral “desktop behind panel” guess — used to fake translucency without ARGB (no KWin blur ghosts).
+_DESKTOP_BACKDROP_DARK = (30, 30, 36)
+_DESKTOP_BACKDROP_LIGHT = (248, 248, 252)
+
+
+def _blend_panel_opacity(
+    surface_rgb: tuple[int, int, int],
+    *,
+    is_dark: bool,
+    opacity: float,
+) -> tuple[int, int, int]:
+    """Blend surface toward a backdrop RGB. ``opacity`` 1 = solid surface, 0 = solid backdrop."""
+    o = max(0.0, min(1.0, opacity))
+    back = _DESKTOP_BACKDROP_DARK if is_dark else _DESKTOP_BACKDROP_LIGHT
+    return tuple(
+        min(255, max(0, round(surface_rgb[i] * o + back[i] * (1.0 - o)))) for i in range(3)
+    )
+
+
+def _system_stats_body(style: str, pal: MaterialPalette) -> str:
+    """CPU/RAM section for bundled ``system`` preset (Conky ``cpubar`` / ``cpugraph`` syntax)."""
+    prim = _hex6(pal, "primary", (0, 150, 150))
+    sec = _hex6(pal, "secondary", (100, 100, 110))
+    ter = _hex6(pal, "tertiary", (160, 160, 170))
+    if style == "bar":
+        return (
+            "${color1}CPU ${cpu cpu0}%\n"
+            "${cpubar cpu0 10,130}\n"
+            "${color1}Load${alignr}${loadavg 1}\n"
+            "${color1}RAM ${memperc}%\n"
+            "${membar 10,130}\n"
+            "${color3}${mem} / ${memmax}"
+        )
+    if style == "graph":
+        return (
+            f"${{color1}}CPU ${{cpu cpu0}}%\n"
+            f"${{cpugraph cpu0 32,130 {prim} {sec}}}\n"
+            f"${{color1}}Load${{alignr}}${{loadavg 1}}\n"
+            f"${{color1}}RAM ${{memperc}}%\n"
+            f"${{memgraph 32,130 {prim} {ter}}}\n"
+            f"${{color3}}${{mem}} / ${{memmax}}"
+        )
+    return (
+        "${color1}CPU${alignr}${cpu cpu0}%\n"
+        "${color1}Load${alignr}${loadavg 1}\n"
+        "${color1}RAM${alignr}${mem} / ${memmax}\n"
+        "${color1}RAM %${alignr}${memperc}%"
+    )
+
+
+def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) -> dict[str, str]:
     ctx = dict(context_from_palette(pal))
     ctx["python_exec"] = shlex.quote(sys.executable)
-    # Solid-ish panel behind text: avoids transparent-desktop compositor glitches when
-    # other windows overlap; own_window_colour wants hex without leading '#'.
+    # Opaque dock window + blended panel colour: true ARGB translucency makes KWin blur the
+    # wallpaper behind the panel; after overlaps that blur often fails to repaint (ghosting).
     surf = pal.colors.get("surface", (22, 22, 28))
-    ctx["panel_bg_hex6"] = rgb_to_hex(surf).lstrip("#")
-    ctx["conky_window_alpha"] = _CONKY_WINDOW_ALPHA
+    settings = load_conky_settings()
+    opa = max(0.0, min(1.0, float(settings.conky_panel_opacity)))
+    blended = _blend_panel_opacity(surf, is_dark=pal.is_dark, opacity=opa)
+    ctx["panel_bg_hex6"] = rgb_to_hex(blended).lstrip("#")
+    st = settings.system_stats_style
+    if st not in ("text", "bar", "graph"):
+        st = "text"
+    ctx["system_stats_body"] = _system_stats_body(st, pal)
+    ctx["system_min_width"] = "280" if st in ("bar", "graph") else "220"
+    if preset_id is not None and preset_id in PRESETS:
+        ctx["conky_alignment"] = alignment_for_preset(preset_id)
+    else:
+        ctx["conky_alignment"] = "top_left"
     return ctx
 
 
@@ -91,7 +190,7 @@ def render_preset(preset_id: str, pal: MaterialPalette) -> Path:
     if preset_id not in PRESETS:
         raise KeyError(f"Unknown preset: {preset_id}")
     raw = load_preset_template(preset_id)
-    ctx = build_render_context(pal)
+    ctx = build_render_context(pal, preset_id=preset_id)
     body = render_template(raw, ctx)
     out_dir = rendered_dir()
     out_dir.mkdir(parents=True, exist_ok=True)

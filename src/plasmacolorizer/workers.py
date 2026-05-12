@@ -286,3 +286,23 @@ class GenerateSchemeWorker(QObject):
             log.exception("GenerateSchemeWorker raised")
             tb = traceback.format_exc(limit=4)
             self.failed.emit(f"{exc}\n\n{tb}")
+
+
+class GeocodeSearchWorker(QObject):
+    """Run Open-Meteo geocoding off the UI thread (stdlib urllib in ``fetch``)."""
+
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, query: str) -> None:
+        super().__init__()
+        self._query = query
+
+    def run(self) -> None:
+        try:
+            from plasmacolorizer.conky.fetch import geocode_search
+
+            hits = geocode_search(self._query)
+            self.finished.emit(hits)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))

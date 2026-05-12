@@ -45,8 +45,8 @@ python -m plasmacolorizer
   - **Verse** — text from the **ESV API** (Crossway). Register at [api.esv.org](https://api.esv.org/) and paste your token under *Conky settings*; passage rotates by calendar day from a built-in list of references. Follow Crossway API / copyright terms.
   - **Weather** — [Open-Meteo](https://open-meteo.com/) (no API key). Set a **city** or **lat, lon** in Conky settings.
 - Rendered configs: `~/.local/share/plasmacolorizer/conky/rendered/<preset>.conf`. PIDs: `~/.cache/plasmacolorizer/conky/`. App settings (ESV key, weather location): `~/.config/plasmacolorizer/settings.json` (mode `600` when possible).
-- Presets are placed in corners to reduce overlap: system **top-left**, shortcuts **top-right**, verse **bottom-left**, weather **bottom-right**.
-- Each preset uses a **semi-opaque** desktop window (~75% opacity via `own_window_argb_value`) and your palette **surface** colour as the panel background so overlapping windows do not corrupt a fully transparent Conky.
+- Default positions: system **top-left**, shortcuts **top-right**, verse **bottom-left**, weather **bottom-right** (each preset has a **3×3 grid** position in Conky settings).
+- Panels are **opaque** `dock` windows; **panel opacity** blends the palette **surface** colour toward a neutral backdrop in RGB (not ARGB translucency), which avoids KDE blur **ghosting** when other windows cross the Conky region.
 - Fetch helpers for Conky `execi` (also useful from a terminal):
 
   ```bash

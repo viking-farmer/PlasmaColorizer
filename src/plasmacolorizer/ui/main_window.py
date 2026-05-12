@@ -4,18 +4,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread
+from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread, QTimer
 from PyQt6.QtGui import QColor, QCloseEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -32,8 +36,10 @@ from PyQt6.QtWidgets import (
 )
 
 from plasmacolorizer.conky import presets as conky_presets
+from plasmacolorizer.conky.fetch import GeocodeHit
+from plasmacolorizer.conky.weather_locations import WEATHER_PRESETS
 from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_settings, save_conky_settings
-from plasmacolorizer.conky.templating import context_from_palette, render_template
+from plasmacolorizer.conky.templating import render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
 from plasmacolorizer.core.logger import get_logger, log_file_path
@@ -41,6 +47,7 @@ from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_ov
 from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
 from plasmacolorizer.workers import (
     ApplyPaletteWorker,
+    GeocodeSearchWorker,
     GenerateSchemeWorker,
     PreviewPaletteWorker,
     WorkerResult,
@@ -71,6 +78,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_color_tab(), "Colorizer")
         tabs.addTab(self._build_conky_tab(), "Conky")
         self.setCentralWidget(tabs)
+        QTimer.singleShot(0, self._startup_autodetect_preview)
 
     # --- Colorizer tab -------------------------------------------------
     def _build_color_tab(self) -> QWidget:
@@ -212,10 +220,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(scheme_box)
 
         step_hint = QLabel(
-            "<b>Detect</b> reads the wallpaper path. <b>Preview palette</b> builds Material You colors "
-            "from the image (CPU only). Adjust accent / emphasis / links, then "
-            "<b>Apply scheme to Plasma</b> to write files and refresh KDE — or use "
-            "<b>Generate and apply</b> for one step with the current mapping."
+            "On launch the app <b>autodetects</b> the Plasma wallpaper for the chosen screen and "
+            "<b>previews</b> the palette. Use <b>Detect</b> / <b>Override</b> / <b>Preview palette</b> "
+            "any time to change the image. <b>Apply scheme to Plasma</b> writes files and refreshes KDE — "
+            "or use <b>Generate and apply</b> for one step with the current mapping."
         )
         step_hint.setWordWrap(True)
         step_hint.setTextFormat(Qt.TextFormat.RichText)
@@ -279,7 +287,8 @@ class MainWindow(QMainWindow):
 
         self._append_log(
             "Ready.\n"
-            "  - Detect: read wallpaper path. Preview palette: build Material You colors (no disk writes).\n"
+            "  - Autodetect + preview runs once when the window opens (Plasma wallpaper for the screen index).\n"
+            "  - Detect / Override / Preview palette: change the image any time (no disk writes until you apply).\n"
             "  - Click swatches to pick colors (KDE’s dialog often includes a screen dropper).\n"
             "  - Adjust accent / emphasis / links, then Apply — or Generate and apply in one step.\n"
             f"  - A detailed log is written to {self._log_file}"
@@ -382,12 +391,16 @@ class MainWindow(QMainWindow):
         self._log.append(msg)
         self._logger.info(msg)
 
-    def _resolve_wallpaper_path(self) -> str | None:
+    def _resolve_wallpaper_path(self, *, silent: bool = False) -> str | None:
         """Resolve the image path on the main thread (DBus must not run on worker thread)."""
         manual = self._manual_path.text().strip()
         if manual:
             if not Path(manual).is_file():
-                QMessageBox.warning(self, "Wallpaper", f"Override path not found: {manual}")
+                msg = f"Override path not found: {manual}"
+                if silent:
+                    self._append_log(msg)
+                else:
+                    QMessageBox.warning(self, "Wallpaper", msg)
                 return None
             self._last_wallpaper_src = manual
             return manual
@@ -402,12 +415,18 @@ class MainWindow(QMainWindow):
             self._last_wallpaper_src = p
             return p
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(
-                self,
-                "Wallpaper",
-                f"Could not detect wallpaper via Plasma DBus.\n\n{exc}\n\n"
-                "Set the Override field to an explicit image path and try again.",
-            )
+            if silent:
+                self._append_log(
+                    f"Could not autodetect wallpaper via Plasma DBus ({exc}). "
+                    "Use Detect or set Override, then Preview palette."
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Wallpaper",
+                    f"Could not detect wallpaper via Plasma DBus.\n\n{exc}\n\n"
+                    "Set the Override field to an explicit image path and try again.",
+                )
             return None
 
     def _on_detect_wallpaper(self) -> None:
@@ -421,12 +440,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Wallpaper", str(exc))
             self._append_log(f"Detect failed: {exc}")
 
-    def _on_preview_palette(self) -> None:
+    def _startup_autodetect_preview(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            return
+        src = self._resolve_wallpaper_path(silent=True)
+        if src is None:
+            return
+        self._path_display.setText(src)
+        self._append_log(f"Startup: autodetected wallpaper ({src}).")
+        self._start_preview_palette(src)
+
+    def _start_preview_palette(self, src: str) -> None:
         if self._thread is not None and self._thread.isRunning():
             self._append_log("Already running.")
-            return
-        src = self._resolve_wallpaper_path()
-        if src is None:
             return
         self._path_display.setText(src)
         self._last_wallpaper_src = src
@@ -451,6 +477,15 @@ class MainWindow(QMainWindow):
         worker.failed.connect(thread.quit)
         thread.finished.connect(self._on_thread_finished)
         thread.start()
+
+    def _on_preview_palette(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            self._append_log("Already running.")
+            return
+        src = self._resolve_wallpaper_path()
+        if src is None:
+            return
+        self._start_preview_palette(src)
 
     def _on_preview_worker_finished(self, mpl_obj: object) -> None:
         pal = mpl_obj
@@ -705,13 +740,71 @@ class MainWindow(QMainWindow):
         self._conky_esv_key = QLineEdit()
         self._conky_esv_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._conky_esv_key.setPlaceholderText("Crossway API token (api.esv.org)")
+        self._conky_weather_preset = QComboBox()
+        self._conky_weather_preset.addItem("Custom — edit city or coordinates below", None)
+        for hit in WEATHER_PRESETS:
+            self._conky_weather_preset.addItem(hit.label, hit)
+        self._conky_weather_preset.setMinimumWidth(320)
+        self._conky_weather_preset.currentIndexChanged.connect(self._on_weather_preset_changed)
+
+        self._conky_weather_search_btn = QPushButton("Search Open-Meteo…")
+        self._conky_weather_search_btn.setObjectName("secondary")
+        self._conky_weather_search_btn.setToolTip(
+            "Search the same geocoding database Open-Meteo uses on their site."
+        )
+        self._conky_weather_search_btn.clicked.connect(self._on_weather_open_meteo_search_clicked)
+
+        quick_row = QHBoxLayout()
+        quick_row.addWidget(self._conky_weather_preset, 1)
+        quick_row.addWidget(self._conky_weather_search_btn)
+
         self._conky_weather_city = QLineEdit()
-        self._conky_weather_city.setPlaceholderText("e.g. Seattle")
+        self._conky_weather_city.setPlaceholderText("City text for geocoding, or set coordinates")
+        self._conky_weather_city.textChanged.connect(self._on_weather_location_manual_edit)
         self._conky_weather_latlon = QLineEdit()
-        self._conky_weather_latlon.setPlaceholderText("Optional: lat, lon (overrides city)")
+        self._conky_weather_latlon.setPlaceholderText("Optional: lat, lon (used with city if both set)")
+        self._conky_weather_latlon.textChanged.connect(self._on_weather_location_manual_edit)
+
+        self._conky_weather_temp_unit = QComboBox()
+        self._conky_weather_temp_unit.addItem("Celsius (°C)", False)
+        self._conky_weather_temp_unit.addItem("Fahrenheit (°F)", True)
+        self._conky_weather_temp_unit.setToolTip("Open-Meteo forecast temperature unit for the Weather preset.")
+
+        self._conky_system_stats_style = QComboBox()
+        self._conky_system_stats_style.addItem("Text — percentages only", "text")
+        self._conky_system_stats_style.addItem("Bar — CPU & RAM bars", "bar")
+        self._conky_system_stats_style.addItem("Graph — CPU & RAM history", "graph")
+        self._conky_system_stats_style.setToolTip(
+            'How the bundled "System" preset draws CPU and RAM. Save, then '
+            '"Apply colors to running Conkys" or restart that preset.'
+        )
+
+        self._conky_panel_opacity = QSlider(Qt.Orientation.Horizontal)
+        self._conky_panel_opacity.setRange(0, 100)
+        self._conky_panel_opacity.setValue(75)
+        self._conky_panel_opacity.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._conky_panel_opacity.setTickInterval(25)
+        self._conky_panel_opacity.setToolTip(
+            "Blends the palette surface color toward a neutral desktop tone. "
+            "Bundled presets use a solid (opaque) dock window so KDE does not apply "
+            "blur-behind translucency that ghosts after other windows overlap."
+        )
+        self._conky_panel_opacity_label = QLabel("75%")
+        self._conky_panel_opacity_label.setMinimumWidth(40)
+        self._conky_panel_opacity.valueChanged.connect(
+            lambda v: self._conky_panel_opacity_label.setText(f"{v}%")
+        )
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(self._conky_panel_opacity, 1)
+        opacity_row.addWidget(self._conky_panel_opacity_label)
+
         settings_form.addRow("ESV API key", self._conky_esv_key)
+        settings_form.addRow("Weather quick pick", quick_row)
         settings_form.addRow("Weather city", self._conky_weather_city)
         settings_form.addRow("Weather lat, lon", self._conky_weather_latlon)
+        settings_form.addRow("Weather temperature", self._conky_weather_temp_unit)
+        settings_form.addRow('System preset: CPU / RAM', self._conky_system_stats_style)
+        settings_form.addRow("Bundled panel opacity", opacity_row)
         bundled_layout.addLayout(settings_form)
 
         save_row = QHBoxLayout()
@@ -723,9 +816,19 @@ class MainWindow(QMainWindow):
         bundled_layout.addLayout(save_row)
 
         self._conky_status_labels = {}
+        self._conky_position_combos: dict[str, QComboBox] = {}
         for pid, meta in conky_presets.PRESETS.items():
             row = QHBoxLayout()
             row.addWidget(QLabel(meta.title), 1)
+            pos_combo = QComboBox()
+            pos_combo.setMinimumWidth(132)
+            pos_combo.setToolTip(
+                "Screen position (3×3 grid). Save Conky settings, then Apply colors or restart this preset."
+            )
+            for align_key, grid_label in conky_presets.CONKY_GRID_ALIGNMENTS:
+                pos_combo.addItem(grid_label, userData=align_key)
+            self._conky_position_combos[pid] = pos_combo
+            row.addWidget(pos_combo)
             st = QLabel("—")
             st.setMinimumWidth(72)
             self._conky_status_labels[pid] = st
@@ -760,7 +863,8 @@ class MainWindow(QMainWindow):
         hint = QLabel(
             "Bundled presets use <code>{{token}}</code> colors from the Colorizer tab. "
             "Verse uses ESV (Crossway terms apply). Weather uses "
-            "<a href=\"https://open-meteo.com\">Open-Meteo</a>."
+            "<a href=\"https://open-meteo.com\">Open-Meteo</a> "
+            "(<a href=\"https://open-meteo.com/en/docs/geocoding-api\">geocoding</a> for search)."
         )
         hint.setWordWrap(True)
         hint.setOpenExternalLinks(True)
@@ -839,22 +943,205 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None, None
 
+    def _set_weather_hit_fields(self, hit: GeocodeHit) -> None:
+        self._conky_weather_city.blockSignals(True)
+        self._conky_weather_latlon.blockSignals(True)
+        try:
+            self._conky_weather_city.setText(hit.label)
+            self._conky_weather_latlon.setText(f"{hit.latitude}, {hit.longitude}")
+        finally:
+            self._conky_weather_city.blockSignals(False)
+            self._conky_weather_latlon.blockSignals(False)
+
+    def _on_weather_preset_changed(self, idx: int) -> None:
+        if idx <= 0:
+            return
+        hit = self._conky_weather_preset.itemData(idx)
+        if not isinstance(hit, GeocodeHit):
+            return
+        self._set_weather_hit_fields(hit)
+
+    def _on_weather_location_manual_edit(self) -> None:
+        self._conky_weather_preset.blockSignals(True)
+        try:
+            self._conky_weather_preset.setCurrentIndex(0)
+        finally:
+            self._conky_weather_preset.blockSignals(False)
+
+    def _sync_weather_preset_combo(self) -> None:
+        lat, lon = self._parse_lat_lon_field(self._conky_weather_latlon.text())
+        idx = 0
+        if lat is not None and lon is not None:
+            tol = 0.025
+            for i, hit in enumerate(WEATHER_PRESETS, start=1):
+                if abs(hit.latitude - lat) < tol and abs(hit.longitude - lon) < tol:
+                    idx = i
+                    break
+        self._conky_weather_preset.blockSignals(True)
+        try:
+            self._conky_weather_preset.setCurrentIndex(idx)
+        finally:
+            self._conky_weather_preset.blockSignals(False)
+
+    def _on_weather_open_meteo_search_clicked(self) -> None:
+        dlg = QDialog(self)
+        dlg.setMinimumWidth(460)
+        dlg.setWindowTitle("Search location — Open-Meteo")
+        lay = QVBoxLayout(dlg)
+
+        hint = QLabel(
+            "Uses the public "
+            '<a href="https://open-meteo.com/en/docs/geocoding-api">Open-Meteo geocoding API</a> '
+            "(same place index as the website). Choose a row, then <b>Use selection</b>."
+        )
+        hint.setWordWrap(True)
+        hint.setOpenExternalLinks(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(hint)
+
+        entry = QLineEdit()
+        entry.setPlaceholderText("e.g. Mannheim, 大阪, Cape Town…")
+        btn_search = QPushButton("Search")
+        btn_search.setObjectName("secondary")
+        row = QHBoxLayout()
+        row.addWidget(entry, 1)
+        row.addWidget(btn_search)
+        lay.addLayout(row)
+
+        list_w = QListWidget()
+        list_w.setMinimumHeight(240)
+        lay.addWidget(list_w)
+
+        def start_search() -> None:
+            q = entry.text().strip()
+            if not q:
+                QMessageBox.information(dlg, "Search", "Enter a place name first.")
+                return
+            prev = getattr(dlg, "_geo_thread", None)
+            if isinstance(prev, QThread) and prev.isRunning():
+                return
+            btn_search.setEnabled(False)
+            list_w.clear()
+            thread = QThread(dlg)
+            worker = GeocodeSearchWorker(q)
+            dlg._geo_thread = thread  # noqa: SLF001
+            dlg._geo_worker = worker  # noqa: SLF001
+            worker.moveToThread(thread)
+
+            def on_fin(hits: object) -> None:
+                btn_search.setEnabled(True)
+                if not isinstance(hits, list):
+                    hits = []
+                for h in hits:
+                    if not isinstance(h, GeocodeHit):
+                        continue
+                    it = QListWidgetItem(h.label)
+                    it.setData(Qt.ItemDataRole.UserRole, h)
+                    list_w.addItem(it)
+                if not hits:
+                    tip = QListWidgetItem("No results — try different words or enter lat/lon manually.")
+                    tip.setFlags(tip.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    list_w.addItem(tip)
+                thread.quit()
+
+            def on_fail(msg: str) -> None:
+                btn_search.setEnabled(True)
+                QMessageBox.warning(dlg, "Geocoding", msg)
+                thread.quit()
+
+            thread.started.connect(worker.run)
+            worker.finished.connect(on_fin)
+            worker.failed.connect(on_fail)
+            thread.finished.connect(worker.deleteLater)
+            thread.start()
+
+        def apply_selection() -> None:
+            it = list_w.currentItem()
+            if it is None:
+                QMessageBox.information(dlg, "Use selection", "Choose a row in the list first.")
+                return
+            hit = it.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(hit, GeocodeHit):
+                return
+            self._set_weather_hit_fields(hit)
+            self._conky_weather_preset.blockSignals(True)
+            try:
+                self._conky_weather_preset.setCurrentIndex(0)
+            finally:
+                self._conky_weather_preset.blockSignals(False)
+            dlg.accept()
+
+        btn_search.clicked.connect(start_search)
+        entry.returnPressed.connect(start_search)
+        list_w.itemDoubleClicked.connect(lambda _it: apply_selection())
+
+        bb = QDialogButtonBox()
+        bb.addButton("Use selection", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton(QDialogButtonBox.StandardButton.Close)
+        bb.accepted.connect(apply_selection)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+
+        dlg.exec()
+
     def _load_conky_settings_into_fields(self) -> None:
         s = load_conky_settings()
         self._conky_esv_key.setText(s.esv_api_key)
-        self._conky_weather_city.setText(s.weather_city)
-        if s.weather_lat is not None and s.weather_lon is not None:
-            self._conky_weather_latlon.setText(f"{s.weather_lat}, {s.weather_lon}")
-        else:
-            self._conky_weather_latlon.clear()
+        self._conky_weather_city.blockSignals(True)
+        self._conky_weather_latlon.blockSignals(True)
+        try:
+            self._conky_weather_city.setText(s.weather_city)
+            if s.weather_lat is not None and s.weather_lon is not None:
+                self._conky_weather_latlon.setText(f"{s.weather_lat}, {s.weather_lon}")
+            else:
+                self._conky_weather_latlon.clear()
+        finally:
+            self._conky_weather_city.blockSignals(False)
+            self._conky_weather_latlon.blockSignals(False)
+        self._sync_weather_preset_combo()
+        self._conky_weather_temp_unit.setCurrentIndex(1 if s.weather_fahrenheit else 0)
+        for i in range(self._conky_system_stats_style.count()):
+            if self._conky_system_stats_style.itemData(i) == s.system_stats_style:
+                self._conky_system_stats_style.setCurrentIndex(i)
+                break
+        pct = max(0, min(100, round(float(s.conky_panel_opacity) * 100)))
+        self._conky_panel_opacity.blockSignals(True)
+        self._conky_panel_opacity.setValue(pct)
+        self._conky_panel_opacity.blockSignals(False)
+        self._conky_panel_opacity_label.setText(f"{pct}%")
+        self._sync_conky_position_combos_from_settings()
+
+    def _sync_conky_position_combos_from_settings(self) -> None:
+        s = load_conky_settings()
+        valid = frozenset(a for a, _ in conky_presets.CONKY_GRID_ALIGNMENTS)
+        for pid, combo in self._conky_position_combos.items():
+            want = (s.conky_preset_positions.get(pid) or "").strip()
+            if want not in valid:
+                want = conky_presets.default_alignment_for_preset(pid)
+            for i in range(combo.count()):
+                if combo.itemData(i) == want:
+                    combo.setCurrentIndex(i)
+                    break
 
     def _conky_save_settings_clicked(self) -> None:
         lat, lon = self._parse_lat_lon_field(self._conky_weather_latlon.text())
+        wf = self._conky_weather_temp_unit.currentData()
+        style = self._conky_system_stats_style.currentData()
         settings = ConkySettings(
             esv_api_key=self._conky_esv_key.text().strip(),
             weather_city=self._conky_weather_city.text().strip(),
             weather_lat=lat,
             weather_lon=lon,
+            weather_fahrenheit=bool(wf),
+            system_stats_style=str(style or "text"),
+            conky_panel_opacity=max(0.0, min(1.0, self._conky_panel_opacity.value() / 100.0)),
+            conky_preset_positions={
+                pid: str(
+                    self._conky_position_combos[pid].currentData()
+                    or conky_presets.default_alignment_for_preset(pid)
+                )
+                for pid in self._conky_position_combos
+            },
         )
         path = save_conky_settings(settings)
         self._append_log(f"Conky settings saved to {path}")
@@ -959,7 +1246,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Conky", str(exc))
             return
-        ctx = context_from_palette(pal)
+        ctx = conky_presets.build_render_context(pal)
         self._conky_preview.setPlainText(render_template(text, ctx))
 
     def _conky_save(self) -> None:
@@ -975,7 +1262,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "Conky", str(exc))
             return
-        ctx = context_from_palette(pal)
+        ctx = conky_presets.build_render_context(pal)
         rendered = render_template(text, ctx)
         out.write_text(rendered, encoding="utf-8")
         QMessageBox.information(self, "Conky", f"Wrote {out}")

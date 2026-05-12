@@ -1,18 +1,17 @@
 -- PlasmaColorizer preset: static KDE-oriented shortcuts (edit template to taste)
 -- Non-interactive reference only.
--- Semi-opaque panel (ARGB) avoids broken transparency when windows cross the Conky region.
+-- Opaque dock panel; “opacity” is blended RGB (no ARGB — avoids KWin blur ghosts after overlaps).
 
 conky.config = {
-    alignment = 'top_right',
+    alignment = '{{conky_alignment}}',
     gap_x = 24,
     gap_y = 48,
     minimum_width = 260,
     own_window = true,
-    own_window_type = 'desktop',
+    own_window_type = 'dock',
     own_window_transparent = false,
     own_window_colour = '{{panel_bg_hex6}}',
-    own_window_argb_visual = true,
-    own_window_argb_value = {{conky_window_alpha}},
+    own_window_argb_visual = false,
     own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
     own_window_title = 'PlasmaColorizer_shortcuts',
     double_buffer = true,
