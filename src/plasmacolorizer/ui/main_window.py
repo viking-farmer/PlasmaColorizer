@@ -31,6 +31,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from plasmacolorizer.conky import presets as conky_presets
+from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_settings, save_conky_settings
 from plasmacolorizer.conky.templating import context_from_palette, render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
@@ -463,6 +465,7 @@ class MainWindow(QMainWindow):
             f"Preview ready: primary={rgb_to_hex(pri)}, dark={pal.is_dark}. "
             "Adjust accent / emphasis / links above, then Apply scheme to Plasma."
         )
+        self._refresh_running_conkys()
 
     def _on_apply_scheme_only(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -597,6 +600,7 @@ class MainWindow(QMainWindow):
         self._update_palette_swatches(result.palette)
         pri = result.palette.colors.get("primary", (0, 0, 0))
         self._append_log(f"Palette ready: primary={rgb_to_hex(pri)}, dark={result.palette.is_dark}")
+        self._refresh_running_conkys()
 
         if not result.apply_ok:
             self._append_log(f"Apply error: {result.apply_error}")
@@ -684,14 +688,94 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         root = QVBoxLayout(wrap)
 
+        bin_path = conky_presets.conky_binary()
+        if not bin_path:
+            miss = QLabel(
+                "<b>conky</b> was not found in <code>PATH</code>. Install the <code>conky</code> package "
+                "to use bundled presets; custom template preview still works."
+            )
+            miss.setWordWrap(True)
+            miss.setTextFormat(Qt.TextFormat.RichText)
+            root.addWidget(miss)
+
+        bundled = QGroupBox("Bundled Conky presets")
+        bundled_layout = QVBoxLayout()
+
+        settings_form = QFormLayout()
+        self._conky_esv_key = QLineEdit()
+        self._conky_esv_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._conky_esv_key.setPlaceholderText("Crossway API token (api.esv.org)")
+        self._conky_weather_city = QLineEdit()
+        self._conky_weather_city.setPlaceholderText("e.g. Seattle")
+        self._conky_weather_latlon = QLineEdit()
+        self._conky_weather_latlon.setPlaceholderText("Optional: lat, lon (overrides city)")
+        settings_form.addRow("ESV API key", self._conky_esv_key)
+        settings_form.addRow("Weather city", self._conky_weather_city)
+        settings_form.addRow("Weather lat, lon", self._conky_weather_latlon)
+        bundled_layout.addLayout(settings_form)
+
+        save_row = QHBoxLayout()
+        save_cfg = QPushButton("Save Conky settings")
+        save_cfg.setObjectName("secondary")
+        save_cfg.clicked.connect(self._conky_save_settings_clicked)
+        save_row.addWidget(save_cfg)
+        save_row.addStretch(1)
+        bundled_layout.addLayout(save_row)
+
+        self._conky_status_labels = {}
+        for pid, meta in conky_presets.PRESETS.items():
+            row = QHBoxLayout()
+            row.addWidget(QLabel(meta.title), 1)
+            st = QLabel("—")
+            st.setMinimumWidth(72)
+            self._conky_status_labels[pid] = st
+            row.addWidget(st)
+            b_start = QPushButton("Start")
+            b_start.setObjectName("secondary")
+            b_start.clicked.connect(lambda _c=False, p=pid: self._conky_start_preset(p))
+            b_stop = QPushButton("Stop")
+            b_stop.setObjectName("secondary")
+            b_stop.clicked.connect(lambda _c=False, p=pid: self._conky_stop_preset(p))
+            row.addWidget(b_start)
+            row.addWidget(b_stop)
+            bundled_layout.addLayout(row)
+
+        apply_row = QHBoxLayout()
+        apply_colors = QPushButton("Apply colors to running Conkys")
+        apply_colors.setToolTip(
+            "Re-render bundled configs from the current palette and restart any preset that was running."
+        )
+        apply_colors.clicked.connect(self._conky_apply_colors_clicked)
+        stop_all = QPushButton("Stop all presets")
+        stop_all.setObjectName("secondary")
+        stop_all.clicked.connect(self._conky_stop_all_clicked)
+        apply_row.addWidget(apply_colors)
+        apply_row.addWidget(stop_all)
+        apply_row.addStretch(1)
+        bundled_layout.addLayout(apply_row)
+
+        bundled.setLayout(bundled_layout)
+        root.addWidget(bundled)
+
         hint = QLabel(
-            "Use <code>{{token}}</code> placeholders (e.g. <code>{{primary}}</code>, "
-            "<code>{{on_surface}}</code>, <code>{{surface}}</code>). "
-            "Tokens are filled from the last successful palette run on the Colorizer tab."
+            "Bundled presets use <code>{{token}}</code> colors from the Colorizer tab. "
+            "Verse uses ESV (Crossway terms apply). Weather uses "
+            "<a href=\"https://open-meteo.com\">Open-Meteo</a>."
         )
         hint.setWordWrap(True)
+        hint.setOpenExternalLinks(True)
         hint.setTextFormat(Qt.TextFormat.RichText)
         root.addWidget(hint)
+
+        custom = QGroupBox("Custom template")
+        custom_layout = QVBoxLayout()
+        ch = QLabel(
+            "Use <code>{{token}}</code> (e.g. <code>{{primary}}</code>, "
+            "<code>{{on_surface}}</code>). Filled from the current effective palette."
+        )
+        ch.setWordWrap(True)
+        ch.setTextFormat(Qt.TextFormat.RichText)
+        custom_layout.addWidget(ch)
 
         grid = QFormLayout()
         self._conky_in = QLineEdit()
@@ -712,7 +796,7 @@ class MainWindow(QMainWindow):
 
         grid.addRow("Template file", in_row)
         grid.addRow("Output file", out_row)
-        root.addLayout(grid)
+        custom_layout.addLayout(grid)
 
         btn_row = QHBoxLayout()
         preview_btn = QPushButton("Preview render")
@@ -722,7 +806,10 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(preview_btn)
         btn_row.addWidget(save_btn)
         btn_row.addStretch(1)
-        root.addLayout(btn_row)
+        custom_layout.addLayout(btn_row)
+
+        custom.setLayout(custom_layout)
+        root.addWidget(custom)
 
         preview_box = QGroupBox("Preview")
         pv_layout = QVBoxLayout()
@@ -730,12 +817,111 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         self._conky_preview = QTextEdit()
         self._conky_preview.setReadOnly(True)
-        self._conky_preview.setMinimumHeight(260)
+        self._conky_preview.setMinimumHeight(200)
         scroll.setWidget(self._conky_preview)
         pv_layout.addWidget(scroll)
         preview_box.setLayout(pv_layout)
         root.addWidget(preview_box)
+
+        self._load_conky_settings_into_fields()
+        self._refresh_conky_status_labels()
         return wrap
+
+    def _parse_lat_lon_field(self, text: str) -> tuple[float | None, float | None]:
+        t = text.strip()
+        if not t:
+            return None, None
+        parts = [x.strip() for x in t.replace(",", " ").split() if x.strip()]
+        if len(parts) != 2:
+            return None, None
+        try:
+            return float(parts[0]), float(parts[1])
+        except ValueError:
+            return None, None
+
+    def _load_conky_settings_into_fields(self) -> None:
+        s = load_conky_settings()
+        self._conky_esv_key.setText(s.esv_api_key)
+        self._conky_weather_city.setText(s.weather_city)
+        if s.weather_lat is not None and s.weather_lon is not None:
+            self._conky_weather_latlon.setText(f"{s.weather_lat}, {s.weather_lon}")
+        else:
+            self._conky_weather_latlon.clear()
+
+    def _conky_save_settings_clicked(self) -> None:
+        lat, lon = self._parse_lat_lon_field(self._conky_weather_latlon.text())
+        settings = ConkySettings(
+            esv_api_key=self._conky_esv_key.text().strip(),
+            weather_city=self._conky_weather_city.text().strip(),
+            weather_lat=lat,
+            weather_lon=lon,
+        )
+        path = save_conky_settings(settings)
+        self._append_log(f"Conky settings saved to {path}")
+        QMessageBox.information(self, "Conky", f"Settings saved to:\n{path}")
+
+    def _refresh_conky_status_labels(self) -> None:
+        for pid, lab in self._conky_status_labels.items():
+            lab.setText("running" if conky_presets.is_preset_running(pid) else "stopped")
+
+    def _conky_start_preset(self, preset_id: str) -> None:
+        pal = self._require_palette()
+        if pal is None:
+            return
+        ok, msg = conky_presets.start_preset(preset_id, pal)
+        self._append_log(f"Conky [{preset_id}]: {msg}")
+        if not ok:
+            QMessageBox.warning(self, "Conky", msg)
+        self._refresh_conky_status_labels()
+
+    def _conky_stop_preset(self, preset_id: str) -> None:
+        ok, msg = conky_presets.stop_preset(preset_id)
+        self._append_log(f"Conky [{preset_id}]: {msg}")
+        if not ok:
+            QMessageBox.warning(self, "Conky", msg)
+        self._refresh_conky_status_labels()
+
+    def _conky_stop_all_clicked(self) -> None:
+        conky_presets.stop_all_presets()
+        self._append_log("Conky: stopped all bundled presets.")
+        self._refresh_conky_status_labels()
+
+    def _conky_apply_colors_clicked(self) -> None:
+        pal = self._require_palette()
+        if pal is None:
+            return
+        running = [p for p in conky_presets.PRESETS if conky_presets.is_preset_running(p)]
+        if not running:
+            QMessageBox.information(
+                self,
+                "Conky",
+                "No bundled presets are running. Start one first, or use this after you have Conkys up.",
+            )
+            return
+        for p in running:
+            conky_presets.stop_preset(p)
+        conky_presets.render_all_presets(pal)
+        for p in running:
+            ok, msg = conky_presets.start_preset(p, pal)
+            self._append_log(f"Conky [{p}] refresh: {msg}")
+            if not ok:
+                QMessageBox.warning(self, "Conky", f"{p}: {msg}")
+        self._refresh_conky_status_labels()
+
+    def _refresh_running_conkys(self) -> None:
+        pal = self._effective_palette()
+        if pal is None:
+            return
+        running = [p for p in conky_presets.PRESETS if conky_presets.is_preset_running(p)]
+        if not running:
+            return
+        for p in running:
+            conky_presets.stop_preset(p)
+        conky_presets.render_all_presets(pal)
+        for p in running:
+            ok, msg = conky_presets.start_preset(p, pal)
+            self._append_log(f"Conky [{p}] palette refresh: {msg}")
+        self._refresh_conky_status_labels()
 
     def _require_palette(self) -> MaterialPalette | None:
         pal = self._effective_palette()

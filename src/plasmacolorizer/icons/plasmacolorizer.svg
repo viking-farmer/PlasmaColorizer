@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Solid fills only — better compatibility with icon themes / loaders. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="10" y="10" width="108" height="108" rx="24" ry="24" fill="#5c4a9e"/>
+  <circle cx="64" cy="64" r="36" fill="none" stroke="#e8e0ff" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="84" cy="44" r="15" fill="#6ee7c5"/>
+  <circle cx="44" cy="80" r="11" fill="#c4b5fd"/>
+</svg>
