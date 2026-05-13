@@ -1,6 +1,6 @@
 -- PlasmaColorizer preset: static KDE-oriented shortcuts (edit template to taste)
 -- Non-interactive reference only.
--- Opaque dock panel; “opacity” is blended RGB (no ARGB — avoids KWin blur ghosts after overlaps).
+-- Opaque ``desktop`` panel that stays *below* normal windows (no ARGB → no KWin blur ghosts).
 
 conky.config = {
     alignment = '{{conky_alignment}}',
@@ -8,7 +8,7 @@ conky.config = {
     gap_y = 48,
     minimum_width = 260,
     own_window = true,
-    own_window_type = 'dock',
+    own_window_type = 'desktop',
     own_window_transparent = false,
     own_window_colour = '{{panel_bg_hex6}}',
     own_window_argb_visual = false,
@@ -18,7 +18,7 @@ conky.config = {
     draw_shades = false,
     draw_outline = false,
     use_xft = true,
-    font = 'sans:size=9',
+    font = '{{theme_font_body}}',
     default_color = '{{on_surface}}',
     color1 = '{{primary}}',
     color2 = '{{secondary}}',
@@ -26,7 +26,7 @@ conky.config = {
 }
 
 conky.text = [[
-${color1}Shortcuts${color2}${hr 1}
+${color1}{{theme_title_open}}Shortcuts{{theme_title_close}}${color2}{{theme_section_divider}}
 ${color1}Launcher${alignr}Meta
 ${color1}Overview${alignr}Meta+W
 ${color1}Clipboard${alignr}Meta+V

@@ -14,6 +14,7 @@ from shutil import which
 
 from plasmacolorizer.conky.settings_store import load_conky_settings
 from plasmacolorizer.conky.templating import context_from_palette, render_template
+from plasmacolorizer.conky.themes import get_theme
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex
 
 @dataclass(frozen=True)
@@ -163,6 +164,15 @@ def _system_stats_body(style: str, pal: MaterialPalette) -> str:
     )
 
 
+def resolve_system_widget_style(settings) -> str:
+    """Effective CPU/RAM widget style: theme override → user setting → ``text``."""
+    theme = get_theme(getattr(settings, "conky_theme_id", None))
+    style = theme.system_widget_style or getattr(settings, "system_stats_style", "text")
+    if style not in ("text", "bar", "graph"):
+        style = "text"
+    return style
+
+
 def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) -> dict[str, str]:
     ctx = dict(context_from_palette(pal))
     ctx["python_exec"] = shlex.quote(sys.executable)
@@ -173,11 +183,16 @@ def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) 
     opa = max(0.0, min(1.0, float(settings.conky_panel_opacity)))
     blended = _blend_panel_opacity(surf, is_dark=pal.is_dark, opacity=opa)
     ctx["panel_bg_hex6"] = rgb_to_hex(blended).lstrip("#")
-    st = settings.system_stats_style
-    if st not in ("text", "bar", "graph"):
-        st = "text"
-    ctx["system_stats_body"] = _system_stats_body(st, pal)
-    ctx["system_min_width"] = "280" if st in ("bar", "graph") else "220"
+
+    theme = get_theme(settings.conky_theme_id)
+    ctx["theme_font_body"] = theme.font_body
+    ctx["theme_title_open"] = theme.title_open
+    ctx["theme_title_close"] = theme.title_close
+    ctx["theme_section_divider"] = theme.section_divider
+
+    style = resolve_system_widget_style(settings)
+    ctx["system_stats_body"] = _system_stats_body(style, pal)
+    ctx["system_min_width"] = "280" if style in ("bar", "graph") else "220"
     if preset_id is not None and preset_id in PRESETS:
         ctx["conky_alignment"] = alignment_for_preset(preset_id)
     else:
@@ -242,16 +257,13 @@ def stop_preset(preset_id: str) -> tuple[bool, str]:
     return True, f"stopped pid {pid}"
 
 
-def start_preset(preset_id: str, pal: MaterialPalette) -> tuple[bool, str]:
-    """Render config and spawn ``conky -c …`` (no ``-d`` so PID stays valid)."""
+def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
+    """Spawn a Conky process for ``cfg`` and record its pid (no ``-d`` so PID stays valid)."""
     bin_path = conky_binary()
     if not bin_path:
         return False, "conky executable not found in PATH"
-
-    cfg = render_preset(preset_id, pal)
     if is_preset_running(preset_id):
         stop_preset(preset_id)
-
     try:
         proc = subprocess.Popen(
             [bin_path, "-c", str(cfg)],
@@ -262,9 +274,78 @@ def start_preset(preset_id: str, pal: MaterialPalette) -> tuple[bool, str]:
         )
     except OSError as exc:
         return False, str(exc)
-
     _pid_file(preset_id).write_text(str(proc.pid), encoding="utf-8")
     return True, f"started pid {proc.pid} ({cfg})"
+
+
+def start_preset(preset_id: str, pal: MaterialPalette) -> tuple[bool, str]:
+    """Render config from the palette and spawn ``conky -c …``."""
+    if preset_id not in PRESETS:
+        return False, f"unknown preset: {preset_id}"
+    cfg = render_preset(preset_id, pal)
+    return _spawn_conky(preset_id, cfg)
+
+
+def start_preset_from_rendered(preset_id: str) -> tuple[bool, str]:
+    """Spawn ``conky -c …`` using the last rendered config (used by login autostart)."""
+    if preset_id not in PRESETS:
+        return False, f"unknown preset: {preset_id}"
+    cfg = rendered_dir() / f"{preset_id}.conf"
+    if not cfg.is_file():
+        return False, f"no rendered config at {cfg}; open PlasmaColorizer once to render"
+    return _spawn_conky(preset_id, cfg)
+
+
+# ---------------------------------------------------------------- autostart
+
+_AUTOSTART_FILE_NAME = "plasmacolorizer-conky.desktop"
+
+
+def autostart_dir() -> Path:
+    return Path.home() / ".config/autostart"
+
+
+def autostart_desktop_path() -> Path:
+    return autostart_dir() / _AUTOSTART_FILE_NAME
+
+
+def autostart_desktop_contents() -> str:
+    """``.desktop`` entry that runs the autostart CLI with the current Python interpreter."""
+    exe = shlex.quote(sys.executable)
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=PlasmaColorizer Conky\n"
+        "Comment=Re-launch the Conky presets that were running in the last session.\n"
+        f"Exec={exe} -m plasmacolorizer.conky.autostart\n"
+        "Icon=plasmacolorizer\n"
+        "Terminal=false\n"
+        "Hidden=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "X-KDE-autostart-after=panel\n"
+    )
+
+
+def install_autostart_entry() -> Path:
+    """Write (or refresh) the autostart ``.desktop`` file. Returns its path."""
+    path = autostart_desktop_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(autostart_desktop_contents(), encoding="utf-8")
+    return path
+
+
+def uninstall_autostart_entry() -> bool:
+    """Remove the autostart ``.desktop`` file (idempotent). True if a file was removed."""
+    path = autostart_desktop_path()
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def autostart_entry_installed() -> bool:
+    return autostart_desktop_path().is_file()
 
 
 def stop_all_presets() -> None:

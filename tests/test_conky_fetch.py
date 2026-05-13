@@ -30,6 +30,24 @@ def test_fetch_esv_line_success() -> None:
     assert "God" in line or "John" in line
 
 
+def test_fetch_esv_line_wraps_long_passage() -> None:
+    settings = ConkySettings(esv_api_key="fake-token")
+    long_text = ("Lorem ipsum dolor sit amet consectetur adipiscing elit " * 12).strip()
+    payload = {"passages": [long_text]}
+
+    def fake_json(url, headers=None, timeout=20.0):
+        return payload
+
+    with patch("plasmacolorizer.conky.fetch.load_conky_settings", return_value=settings):
+        with patch("plasmacolorizer.conky.fetch._http_get_json", side_effect=fake_json):
+            line = fetch.fetch_esv_line()
+    lines = line.splitlines()
+    assert len(lines) >= 4
+    for chunk in lines:
+        assert len(chunk) <= 64
+    assert "Lorem" in line
+
+
 def test_fetch_weather_line_no_location() -> None:
     with patch("plasmacolorizer.conky.fetch.load_conky_settings", return_value=ConkySettings()):
         line = fetch.fetch_weather_line()

@@ -25,6 +25,12 @@ class ConkySettings:
     conky_panel_opacity: float = 0.75
     # preset_id → Conky ``alignment`` (3×3 grid). Missing keys use bundled defaults.
     conky_preset_positions: dict[str, str] = field(default_factory=dict)
+    # Install ~/.config/autostart/plasmacolorizer-conky.desktop and respawn last-running presets at login.
+    autostart_enabled: bool = True
+    # Preset ids that were running last time (updated whenever you Start/Stop a bundled preset).
+    autostart_preset_ids: list[str] = field(default_factory=list)
+    # Visual theme id (see ``plasmacolorizer.conky.themes.THEMES``); colors stay palette-driven.
+    conky_theme_id: str = "material"
 
     def to_json_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -43,6 +49,9 @@ class ConkySettings:
             system_stats_style=_opt_system_stats_style(data.get("system_stats_style")),
             conky_panel_opacity=_opt_opacity(data.get("conky_panel_opacity")),
             conky_preset_positions=_opt_preset_positions(data.get("conky_preset_positions")),
+            autostart_enabled=_opt_bool_with_default(data.get("autostart_enabled"), default=True),
+            autostart_preset_ids=_opt_str_list(data.get("autostart_preset_ids")),
+            conky_theme_id=_opt_theme_id(data.get("conky_theme_id")),
         )
 
 
@@ -88,6 +97,26 @@ def _opt_preset_positions(v: Any) -> dict[str, str]:
         if isinstance(key, str) and isinstance(val, str):
             out[key] = val
     return out
+
+
+def _opt_bool_with_default(v: Any, *, default: bool) -> bool:
+    if v is None:
+        return default
+    return _opt_bool(v)
+
+
+def _opt_str_list(v: Any) -> list[str]:
+    if not isinstance(v, list):
+        return []
+    return [x for x in v if isinstance(x, str)]
+
+
+def _opt_theme_id(v: Any) -> str:
+    # Import lazily so this module stays free of theme dependencies during basic loads.
+    from plasmacolorizer.conky.themes import DEFAULT_THEME_ID, THEMES
+
+    s = (str(v) if v is not None else "").strip()
+    return s if s in THEMES else DEFAULT_THEME_ID
 
 
 def config_dir() -> Path:

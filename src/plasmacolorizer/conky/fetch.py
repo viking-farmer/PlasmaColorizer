@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -177,9 +178,12 @@ def fetch_esv_line() -> str:
     if not isinstance(text, str):
         return "ESV: bad passage"
     one = " ".join(text.split())
-    if len(one) > 220:
-        one = one[:217] + "…"
-    return one
+    # Conky has no automatic word-wrap; emit explicit newlines so the verse panel
+    # grows in height instead of clipping at ``maximum_width``. ~58 chars matches
+    # ``sans:size=9`` at the bundled ``maximum_width = 420``.
+    if len(one) > 800:
+        one = one[:797] + "…"
+    return textwrap.fill(one, width=58, break_long_words=False, break_on_hyphens=False)
 
 
 def _format_geocode_row(row: dict) -> str:

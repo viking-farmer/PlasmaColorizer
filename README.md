@@ -46,7 +46,7 @@ python -m plasmacolorizer
   - **Weather** — [Open-Meteo](https://open-meteo.com/) (no API key). Set a **city** or **lat, lon** in Conky settings.
 - Rendered configs: `~/.local/share/plasmacolorizer/conky/rendered/<preset>.conf`. PIDs: `~/.cache/plasmacolorizer/conky/`. App settings (ESV key, weather location): `~/.config/plasmacolorizer/settings.json` (mode `600` when possible).
 - Default positions: system **top-left**, shortcuts **top-right**, verse **bottom-left**, weather **bottom-right** (each preset has a **3×3 grid** position in Conky settings).
-- Panels are **opaque** `dock` windows; **panel opacity** blends the palette **surface** colour toward a neutral backdrop in RGB (not ARGB translucency), which avoids KDE blur **ghosting** when other windows cross the Conky region.
+- Panels are **opaque** `desktop`-layer windows so other windows **always pass over them**; **panel transparency** blends the palette **surface** colour toward a neutral backdrop in RGB (not ARGB translucency), which also avoids KDE blur **ghosting** when other windows cross the Conky region.
 - Fetch helpers for Conky `execi` (also useful from a terminal):
 
   ```bash

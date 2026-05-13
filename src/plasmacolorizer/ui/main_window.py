@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from plasmacolorizer.conky import presets as conky_presets
+from plasmacolorizer.conky import themes as conky_themes
 from plasmacolorizer.conky.fetch import GeocodeHit
 from plasmacolorizer.conky.weather_locations import WEATHER_PRESETS
 from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_settings, save_conky_settings
@@ -779,32 +780,44 @@ class MainWindow(QMainWindow):
             '"Apply colors to running Conkys" or restart that preset.'
         )
 
-        self._conky_panel_opacity = QSlider(Qt.Orientation.Horizontal)
-        self._conky_panel_opacity.setRange(0, 100)
-        self._conky_panel_opacity.setValue(75)
-        self._conky_panel_opacity.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self._conky_panel_opacity.setTickInterval(25)
-        self._conky_panel_opacity.setToolTip(
+        self._conky_theme_combo = QComboBox()
+        for theme in conky_themes.theme_choices():
+            self._conky_theme_combo.addItem(theme.label, theme.theme_id)
+        self._conky_theme_combo.setToolTip(
+            "Bundled visual style for all Conky presets. Themes change fonts, section "
+            "headings, dividers, and (for the System preset) whether CPU/RAM are drawn "
+            "as text, bars, or graphs. Palette colors are unchanged."
+        )
+        self._conky_theme_combo.currentIndexChanged.connect(self._on_conky_theme_changed)
+
+        self._conky_panel_transparency = QSlider(Qt.Orientation.Horizontal)
+        self._conky_panel_transparency.setRange(0, 100)
+        self._conky_panel_transparency.setValue(25)
+        self._conky_panel_transparency.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._conky_panel_transparency.setTickInterval(25)
+        self._conky_panel_transparency.setToolTip(
             "Blends the palette surface color toward a neutral desktop tone. "
-            "Bundled presets use a solid (opaque) dock window so KDE does not apply "
-            "blur-behind translucency that ghosts after other windows overlap."
+            "0% = solid surface, 100% = fully blended (most see-through). "
+            "Bundled presets stay opaque ``desktop``-layer windows so other "
+            "windows always pass over them and KDE does not apply blur-behind."
         )
-        self._conky_panel_opacity_label = QLabel("75%")
-        self._conky_panel_opacity_label.setMinimumWidth(40)
-        self._conky_panel_opacity.valueChanged.connect(
-            lambda v: self._conky_panel_opacity_label.setText(f"{v}%")
+        self._conky_panel_transparency_label = QLabel("25%")
+        self._conky_panel_transparency_label.setMinimumWidth(40)
+        self._conky_panel_transparency.valueChanged.connect(
+            lambda v: self._conky_panel_transparency_label.setText(f"{v}%")
         )
-        opacity_row = QHBoxLayout()
-        opacity_row.addWidget(self._conky_panel_opacity, 1)
-        opacity_row.addWidget(self._conky_panel_opacity_label)
+        transparency_row = QHBoxLayout()
+        transparency_row.addWidget(self._conky_panel_transparency, 1)
+        transparency_row.addWidget(self._conky_panel_transparency_label)
 
         settings_form.addRow("ESV API key", self._conky_esv_key)
         settings_form.addRow("Weather quick pick", quick_row)
         settings_form.addRow("Weather city", self._conky_weather_city)
         settings_form.addRow("Weather lat, lon", self._conky_weather_latlon)
         settings_form.addRow("Weather temperature", self._conky_weather_temp_unit)
+        settings_form.addRow("Conky theme", self._conky_theme_combo)
         settings_form.addRow('System preset: CPU / RAM', self._conky_system_stats_style)
-        settings_form.addRow("Bundled panel opacity", opacity_row)
+        settings_form.addRow("Bundled panel transparency", transparency_row)
         bundled_layout.addLayout(settings_form)
 
         save_row = QHBoxLayout()
@@ -856,6 +869,17 @@ class MainWindow(QMainWindow):
         apply_row.addWidget(stop_all)
         apply_row.addStretch(1)
         bundled_layout.addLayout(apply_row)
+
+        self._conky_autostart_check = QCheckBox(
+            "Auto-start running Conkys at login (remember last state)"
+        )
+        self._conky_autostart_check.setToolTip(
+            "Installs ~/.config/autostart/plasmacolorizer-conky.desktop. "
+            "On login it spawns whichever bundled presets were running in your last session, "
+            "using the last rendered configs in ~/.local/share/plasmacolorizer/conky/rendered/."
+        )
+        self._conky_autostart_check.toggled.connect(self._on_conky_autostart_toggled)
+        bundled_layout.addWidget(self._conky_autostart_check)
 
         bundled.setLayout(bundled_layout)
         root.addWidget(bundled)
@@ -1104,12 +1128,58 @@ class MainWindow(QMainWindow):
             if self._conky_system_stats_style.itemData(i) == s.system_stats_style:
                 self._conky_system_stats_style.setCurrentIndex(i)
                 break
-        pct = max(0, min(100, round(float(s.conky_panel_opacity) * 100)))
-        self._conky_panel_opacity.blockSignals(True)
-        self._conky_panel_opacity.setValue(pct)
-        self._conky_panel_opacity.blockSignals(False)
-        self._conky_panel_opacity_label.setText(f"{pct}%")
+        transparency_pct = max(0, min(100, 100 - round(float(s.conky_panel_opacity) * 100)))
+        self._conky_panel_transparency.blockSignals(True)
+        self._conky_panel_transparency.setValue(transparency_pct)
+        self._conky_panel_transparency.blockSignals(False)
+        self._conky_panel_transparency_label.setText(f"{transparency_pct}%")
         self._sync_conky_position_combos_from_settings()
+        self._conky_theme_combo.blockSignals(True)
+        try:
+            for i in range(self._conky_theme_combo.count()):
+                if self._conky_theme_combo.itemData(i) == s.conky_theme_id:
+                    self._conky_theme_combo.setCurrentIndex(i)
+                    break
+        finally:
+            self._conky_theme_combo.blockSignals(False)
+        self._refresh_system_style_lock()
+        self._conky_autostart_check.blockSignals(True)
+        self._conky_autostart_check.setChecked(bool(s.autostart_enabled))
+        self._conky_autostart_check.blockSignals(False)
+        # Reconcile the .desktop entry with the saved preference so toggling matches reality.
+        if s.autostart_enabled and not conky_presets.autostart_entry_installed():
+            try:
+                conky_presets.install_autostart_entry()
+            except OSError as exc:
+                self._append_log(f"Autostart: could not install entry: {exc}")
+        elif not s.autostart_enabled and conky_presets.autostart_entry_installed():
+            conky_presets.uninstall_autostart_entry()
+
+    def _on_conky_theme_changed(self, _idx: int) -> None:
+        self._refresh_system_style_lock()
+
+    def _refresh_system_style_lock(self) -> None:
+        """When the chosen theme forces a system widget style, lock the user combo to it."""
+        theme_id = self._conky_theme_combo.currentData() if self._conky_theme_combo else None
+        forced = conky_themes.get_theme(theme_id).system_widget_style
+        base_tip = (
+            'How the bundled "System" preset draws CPU and RAM. Save, then '
+            '"Apply colors to running Conkys" or restart that preset.'
+        )
+        if forced:
+            self._conky_system_stats_style.setEnabled(False)
+            for i in range(self._conky_system_stats_style.count()):
+                if self._conky_system_stats_style.itemData(i) == forced:
+                    self._conky_system_stats_style.blockSignals(True)
+                    self._conky_system_stats_style.setCurrentIndex(i)
+                    self._conky_system_stats_style.blockSignals(False)
+                    break
+            self._conky_system_stats_style.setToolTip(
+                base_tip + f"\n\nThe current theme forces “{forced}” — change the theme to edit this."
+            )
+        else:
+            self._conky_system_stats_style.setEnabled(True)
+            self._conky_system_stats_style.setToolTip(base_tip)
 
     def _sync_conky_position_combos_from_settings(self) -> None:
         s = load_conky_settings()
@@ -1124,25 +1194,29 @@ class MainWindow(QMainWindow):
                     break
 
     def _conky_save_settings_clicked(self) -> None:
+        # Mutate the loaded settings so newer fields (autostart, etc.) survive saves.
+        settings = load_conky_settings()
         lat, lon = self._parse_lat_lon_field(self._conky_weather_latlon.text())
-        wf = self._conky_weather_temp_unit.currentData()
-        style = self._conky_system_stats_style.currentData()
-        settings = ConkySettings(
-            esv_api_key=self._conky_esv_key.text().strip(),
-            weather_city=self._conky_weather_city.text().strip(),
-            weather_lat=lat,
-            weather_lon=lon,
-            weather_fahrenheit=bool(wf),
-            system_stats_style=str(style or "text"),
-            conky_panel_opacity=max(0.0, min(1.0, self._conky_panel_opacity.value() / 100.0)),
-            conky_preset_positions={
-                pid: str(
-                    self._conky_position_combos[pid].currentData()
-                    or conky_presets.default_alignment_for_preset(pid)
-                )
-                for pid in self._conky_position_combos
-            },
+        settings.esv_api_key = self._conky_esv_key.text().strip()
+        settings.weather_city = self._conky_weather_city.text().strip()
+        settings.weather_lat = lat
+        settings.weather_lon = lon
+        settings.weather_fahrenheit = bool(self._conky_weather_temp_unit.currentData())
+        settings.system_stats_style = str(self._conky_system_stats_style.currentData() or "text")
+        settings.conky_panel_opacity = max(
+            0.0, min(1.0, 1.0 - self._conky_panel_transparency.value() / 100.0)
         )
+        settings.conky_theme_id = str(
+            self._conky_theme_combo.currentData() or conky_themes.DEFAULT_THEME_ID
+        )
+        settings.conky_preset_positions = {
+            pid: str(
+                self._conky_position_combos[pid].currentData()
+                or conky_presets.default_alignment_for_preset(pid)
+            )
+            for pid in self._conky_position_combos
+        }
+        settings.autostart_enabled = bool(self._conky_autostart_check.isChecked())
         path = save_conky_settings(settings)
         self._append_log(f"Conky settings saved to {path}")
         QMessageBox.information(self, "Conky", f"Settings saved to:\n{path}")
@@ -1160,6 +1234,7 @@ class MainWindow(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "Conky", msg)
         self._refresh_conky_status_labels()
+        self._persist_autostart_running()
 
     def _conky_stop_preset(self, preset_id: str) -> None:
         ok, msg = conky_presets.stop_preset(preset_id)
@@ -1167,11 +1242,13 @@ class MainWindow(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "Conky", msg)
         self._refresh_conky_status_labels()
+        self._persist_autostart_running()
 
     def _conky_stop_all_clicked(self) -> None:
         conky_presets.stop_all_presets()
         self._append_log("Conky: stopped all bundled presets.")
         self._refresh_conky_status_labels()
+        self._persist_autostart_running()
 
     def _conky_apply_colors_clicked(self) -> None:
         pal = self._require_palette()
@@ -1194,6 +1271,48 @@ class MainWindow(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Conky", f"{p}: {msg}")
         self._refresh_conky_status_labels()
+        self._persist_autostart_running()
+
+    def _persist_autostart_running(self) -> None:
+        """Snapshot which bundled presets are running and update settings + autostart entry."""
+        try:
+            settings = load_conky_settings()
+        except OSError as exc:
+            self._append_log(f"Autostart: could not load settings: {exc}")
+            return
+        running = [pid for pid in conky_presets.PRESETS if conky_presets.is_preset_running(pid)]
+        if list(settings.autostart_preset_ids) != running:
+            settings.autostart_preset_ids = running
+            try:
+                save_conky_settings(settings)
+            except OSError as exc:
+                self._append_log(f"Autostart: could not save running set: {exc}")
+                return
+        if settings.autostart_enabled and not conky_presets.autostart_entry_installed():
+            try:
+                conky_presets.install_autostart_entry()
+            except OSError as exc:
+                self._append_log(f"Autostart: could not install entry: {exc}")
+
+    def _on_conky_autostart_toggled(self, checked: bool) -> None:
+        try:
+            settings = load_conky_settings()
+            settings.autostart_enabled = bool(checked)
+            save_conky_settings(settings)
+        except OSError as exc:
+            self._append_log(f"Autostart: could not save settings: {exc}")
+            return
+        if checked:
+            try:
+                path = conky_presets.install_autostart_entry()
+                self._append_log(f"Autostart enabled: wrote {path}")
+            except OSError as exc:
+                self._append_log(f"Autostart: could not install entry: {exc}")
+        else:
+            removed = conky_presets.uninstall_autostart_entry()
+            self._append_log(
+                "Autostart disabled" + (" (removed entry)" if removed else "")
+            )
 
     def _refresh_running_conkys(self) -> None:
         pal = self._effective_palette()
