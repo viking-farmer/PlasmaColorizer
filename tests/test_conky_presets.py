@@ -39,11 +39,16 @@ def test_render_preset_substitutes_hex(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "{{theme_title_open}}" not in body
     assert "own_window_transparent = false" in body
     assert "own_window_colour =" in body
-    assert "131318" in body  # blended panel at default 75% opacity (surface + backdrop)
-    assert "own_window_argb_visual = false" in body
-    # Conkys must stay below normal windows (desktop layer in KWin).
-    assert "own_window_type = 'desktop'" in body
-    assert "own_window_argb_value" not in body
+    assert "0f0f14" in body  # pure surface color (transparency comes from ARGB alpha)
+    assert "own_window_argb_visual = true" in body
+    # Use ``normal`` window type so KWin tracks damage events and repaints
+    # cleanly under window overlap; the ``below`` hint keeps it stacked under
+    # all real application windows.
+    assert "own_window_type = 'normal'" in body
+    assert "below" in body  # comes from own_window_hints
+    # Default opacity 0.75 → alpha = 191. Slider position is (1 - opacity).
+    assert "own_window_argb_value = 191" in body
+    assert "own_window_class = 'PlasmaColorizerConky'" in body
     assert "alignment = 'top_right'" in body
     # default theme = Material Minimal: sans:size=10 body font and hr-1 divider.
     assert "font = 'sans:size=10'" in body
@@ -104,8 +109,17 @@ def test_build_render_context_panel_opacity(
     monkeypatch.setenv("HOME", str(tmp_path))
     save_conky_settings(ConkySettings(conky_panel_opacity=1.0))
     ctx = presets.build_render_context(_minimal_palette())
-    assert ctx["panel_bg_hex6"] == "0f0f14"  # pure surface at 100%
-    assert "conky_window_alpha" not in ctx
+    assert ctx["panel_bg_hex6"] == "0f0f14"  # pure surface
+    assert ctx["conky_window_alpha"] == "255"
+
+
+def test_build_render_context_full_transparency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_conky_settings(ConkySettings(conky_panel_opacity=0.0))
+    ctx = presets.build_render_context(_minimal_palette())
+    assert ctx["conky_window_alpha"] == "0"
 
 
 def test_blend_panel_opacity_mid_and_zero() -> None:

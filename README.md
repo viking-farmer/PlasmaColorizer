@@ -46,7 +46,7 @@ python -m plasmacolorizer
   - **Weather** — [Open-Meteo](https://open-meteo.com/) (no API key). Set a **city** or **lat, lon** in Conky settings.
 - Rendered configs: `~/.local/share/plasmacolorizer/conky/rendered/<preset>.conf`. PIDs: `~/.cache/plasmacolorizer/conky/`. App settings (ESV key, weather location): `~/.config/plasmacolorizer/settings.json` (mode `600` when possible).
 - Default positions: system **top-left**, shortcuts **top-right**, verse **bottom-left**, weather **bottom-right** (each preset has a **3×3 grid** position in Conky settings).
-- Panels are **opaque** `desktop`-layer windows so other windows **always pass over them**; **panel transparency** blends the palette **surface** colour toward a neutral backdrop in RGB (not ARGB translucency), which also avoids KDE blur **ghosting** when other windows cross the Conky region.
+- Panels use **real ARGB transparency** driven by the **panel transparency** slider (slider lowest = solid surface, highest = fully see-through with only the text/icons rendered). To stay **below every real application window without ghosting**, the panels run as `own_window_type = 'normal'` with the `below` state plus `skip_taskbar` / `skip_pager` / `sticky` / `undecorated` hints — KWin treats them as ordinary managed windows so damage / expose events repaint them cleanly when overlapping windows move, while the `below` state guarantees no real window is ever covered. Panels also set `own_window_class = 'PlasmaColorizerConky'` so you can target them with a custom KWin window rule if your setup ever needs one.
 - Fetch helpers for Conky `execi` (also useful from a terminal):
 
   ```bash

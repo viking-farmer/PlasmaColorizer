@@ -796,10 +796,11 @@ class MainWindow(QMainWindow):
         self._conky_panel_transparency.setTickPosition(QSlider.TickPosition.TicksBelow)
         self._conky_panel_transparency.setTickInterval(25)
         self._conky_panel_transparency.setToolTip(
-            "Blends the palette surface color toward a neutral desktop tone. "
-            "0% = solid surface, 100% = fully blended (most see-through). "
-            "Bundled presets stay opaque ``desktop``-layer windows so other "
-            "windows always pass over them and KDE does not apply blur-behind."
+            "Real ARGB transparency for bundled Conky panels. "
+            "0% = solid surface, 100% = fully see-through (only the text/widgets remain). "
+            "Panels run as ``normal`` windows pinned below everything so KWin tracks "
+            "damage events properly (no ghosting under window overlap) while still "
+            "keeping every real application window above them."
         )
         self._conky_panel_transparency_label = QLabel("25%")
         self._conky_panel_transparency_label.setMinimumWidth(40)

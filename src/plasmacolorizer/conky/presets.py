@@ -176,13 +176,14 @@ def resolve_system_widget_style(settings) -> str:
 def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) -> dict[str, str]:
     ctx = dict(context_from_palette(pal))
     ctx["python_exec"] = shlex.quote(sys.executable)
-    # Opaque dock window + blended panel colour: true ARGB translucency makes KWin blur the
-    # wallpaper behind the panel; after overlaps that blur often fails to repaint (ghosting).
+    # Real ARGB transparency: ``own_window_argb_value`` drives the panel alpha
+    # (slider lowest = 255, slider highest = 0).  The panel colour is the
+    # palette surface so partial alpha shows the wallpaper through a tinted layer.
     surf = pal.colors.get("surface", (22, 22, 28))
+    ctx["panel_bg_hex6"] = rgb_to_hex(surf).lstrip("#")
     settings = load_conky_settings()
     opa = max(0.0, min(1.0, float(settings.conky_panel_opacity)))
-    blended = _blend_panel_opacity(surf, is_dark=pal.is_dark, opacity=opa)
-    ctx["panel_bg_hex6"] = rgb_to_hex(blended).lstrip("#")
+    ctx["conky_window_alpha"] = str(round(opa * 255))
 
     theme = get_theme(settings.conky_theme_id)
     ctx["theme_font_body"] = theme.font_body
