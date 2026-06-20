@@ -122,6 +122,32 @@ def test_build_render_context_full_transparency(
     assert ctx["conky_window_alpha"] == "0"
 
 
+def test_opacity_to_cardinal_endpoints_and_midpoint() -> None:
+    # _NET_WM_WINDOW_OPACITY is a 32-bit CARDINAL: 0 = fully transparent,
+    # 0xFFFFFFFF = fully opaque.
+    assert presets._opacity_to_cardinal(0.0) == 0
+    assert presets._opacity_to_cardinal(1.0) == 0xFFFFFFFF
+    # 0.5 -> 0x7FFFFFFF or 0x80000000 (rounding); we accept either side of .5.
+    mid = presets._opacity_to_cardinal(0.5)
+    assert mid in (0x7FFFFFFF, 0x80000000)
+    # Out-of-range inputs clamp instead of overflowing.
+    assert presets._opacity_to_cardinal(-0.25) == 0
+    assert presets._opacity_to_cardinal(1.7) == 0xFFFFFFFF
+
+
+def test_apply_window_opacity_noop_without_xprop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No xprop installed → silent no-op, no thread spawned, no subprocess call."""
+    monkeypatch.setattr(presets, "which", lambda _name: None)
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("subprocess.run must not be called when xprop is missing")
+
+    monkeypatch.setattr(presets.subprocess, "run", _boom)
+    presets._apply_window_opacity("PlasmaColorizer_test", 0.5)
+
+
 def test_blend_panel_opacity_mid_and_zero() -> None:
     assert presets._blend_panel_opacity((15, 15, 20), is_dark=True, opacity=0.75) == (19, 19, 24)
     assert presets._blend_panel_opacity((15, 15, 20), is_dark=True, opacity=0.0) == (30, 30, 36)

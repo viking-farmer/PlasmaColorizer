@@ -117,19 +117,26 @@ class MainWindow(QMainWindow):
         self._dark_combo = QComboBox()
         self._dark_combo.addItems(["Follow KDE", "Force dark", "Force light"])
 
-        green_row = QHBoxLayout()
-        self._green_slider = QSlider(Qt.Orientation.Horizontal)
-        self._green_slider.setRange(0, 100)
-        self._green_slider.setValue(0)
-        self._green_label = QLabel("0%")
-        self._green_slider.valueChanged.connect(lambda v: self._green_label.setText(f"{v}%"))
-        green_row.addWidget(self._green_slider, 1)
-        green_row.addWidget(self._green_label)
+        primary_bias_row = QHBoxLayout()
+        self._primary_bias_slider = QSlider(Qt.Orientation.Horizontal)
+        self._primary_bias_slider.setRange(0, 100)
+        self._primary_bias_slider.setValue(0)
+        self._primary_bias_slider.setToolTip(
+            "Nudges the wallpaper seed toward the Material primary accent for the "
+            "chosen light/dark mode. 0% = raw extracted colour, 100% = strongest "
+            "primary emphasis (still wallpaper-driven, not a fixed hue)."
+        )
+        self._primary_bias_label = QLabel("0%")
+        self._primary_bias_slider.valueChanged.connect(
+            lambda v: self._primary_bias_label.setText(f"{v}%")
+        )
+        primary_bias_row.addWidget(self._primary_bias_slider, 1)
+        primary_bias_row.addWidget(self._primary_bias_label)
 
         form.addRow("Screen index", self._monitor)
         form.addRow("Quantizer quality", self._quality)
         form.addRow("UI mode", self._dark_combo)
-        form.addRow("Green accent bias", green_row)
+        form.addRow("Primary color bias", primary_bias_row)
 
         box.setLayout(form)
         layout.addWidget(box)
@@ -463,7 +470,7 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker = PreviewPaletteWorker(
             src_path=src,
-            green_strength=self._green_slider.value() / 100.0,
+            primary_bias_strength=self._primary_bias_slider.value() / 100.0,
             dark=self._dark_choice(),
             quality=self._quality.value(),
         )
@@ -593,7 +600,7 @@ class MainWindow(QMainWindow):
         thread = QThread(self)  # parented -> stays alive with MainWindow
         worker = GenerateSchemeWorker(
             src_path=src,
-            green_strength=self._green_slider.value() / 100.0,
+            primary_bias_strength=self._primary_bias_slider.value() / 100.0,
             dark=self._dark_choice(),
             quality=self._quality.value(),
             choices=self._scheme_choices(),
@@ -805,7 +812,7 @@ class MainWindow(QMainWindow):
         self._conky_panel_transparency_label = QLabel("25%")
         self._conky_panel_transparency_label.setMinimumWidth(40)
         self._conky_panel_transparency.valueChanged.connect(
-            lambda v: self._conky_panel_transparency_label.setText(f"{v}%")
+            self._on_panel_transparency_changed,
         )
         transparency_row = QHBoxLayout()
         transparency_row.addWidget(self._conky_panel_transparency, 1)
@@ -1158,6 +1165,21 @@ class MainWindow(QMainWindow):
 
     def _on_conky_theme_changed(self, _idx: int) -> None:
         self._refresh_system_style_lock()
+
+    def _on_panel_transparency_changed(self, value: int) -> None:
+        """Live preview: as the slider moves, push the new opacity to running Conkys.
+
+        ``_NET_WM_WINDOW_OPACITY`` is the universal compositor opacity hint
+        (Conky's own ``own_window_argb_value`` is ignored by KWin/XWayland on
+        most setups), so re-applying it gives immediate visible feedback
+        without re-rendering / restarting the Conky processes.
+        """
+        self._conky_panel_transparency_label.setText(f"{value}%")
+        opacity = max(0.0, min(1.0, 1.0 - value / 100.0))
+        try:
+            conky_presets.apply_panel_opacity_to_running(opacity)
+        except (OSError, RuntimeError) as exc:  # best-effort live preview
+            self._append_log(f"Panel transparency: live update failed: {exc}")
 
     def _refresh_system_style_lock(self) -> None:
         """When the chosen theme forces a system widget style, lock the user combo to it."""

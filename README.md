@@ -5,7 +5,7 @@ PyQt6 utility for **KDE Plasma** (Manjaro-friendly) that:
 - Reads the active wallpaper via **`org.kde.PlasmaShell`** (DBus).
 - Extracts a seed color with **materialyoucolor** and builds a Material You–style palette.
 - Writes `~/.local/share/color-schemes/PlasmaColorizer.colors`, merges into `~/.config/kdeglobals`, and refreshes Plasma accent (see app sources).
-- Optional **green accent bias** (shifts the seed hue toward green before scheme generation).
+- Optional **primary color bias** (nudges the wallpaper seed toward the Material primary accent before scheme generation).
 - Offers a **Conky** tab with **bundled presets** (system stats, shortcuts, ESV verse, Open-Meteo weather) plus custom `{{token}}` templates filled from the palette.
 
 ## Requirements
@@ -46,7 +46,7 @@ python -m plasmacolorizer
   - **Weather** — [Open-Meteo](https://open-meteo.com/) (no API key). Set a **city** or **lat, lon** in Conky settings.
 - Rendered configs: `~/.local/share/plasmacolorizer/conky/rendered/<preset>.conf`. PIDs: `~/.cache/plasmacolorizer/conky/`. App settings (ESV key, weather location): `~/.config/plasmacolorizer/settings.json` (mode `600` when possible).
 - Default positions: system **top-left**, shortcuts **top-right**, verse **bottom-left**, weather **bottom-right** (each preset has a **3×3 grid** position in Conky settings).
-- Panels use **real ARGB transparency** driven by the **panel transparency** slider (slider lowest = solid surface, highest = fully see-through with only the text/icons rendered). To stay **below every real application window without ghosting**, the panels run as `own_window_type = 'normal'` with the `below` state plus `skip_taskbar` / `skip_pager` / `sticky` / `undecorated` hints — KWin treats them as ordinary managed windows so damage / expose events repaint them cleanly when overlapping windows move, while the `below` state guarantees no real window is ever covered. Panels also set `own_window_class = 'PlasmaColorizerConky'` so you can target them with a custom KWin window rule if your setup ever needs one.
+- Panels use **real compositor transparency** driven by the **panel transparency** slider (slider lowest = solid surface, highest = fully see-through with only the text/icons rendered). Because Conky's own `own_window_argb_value` is silently ignored by KWin on XWayland on most setups, PlasmaColorizer also sets the **`_NET_WM_WINDOW_OPACITY`** X11 atom on every spawned Conky window (via `xprop`) — that's the universal compositor opacity hint and KWin always honors it. Dragging the slider updates this property **live** on all running panels (no restart needed). To stay **below every real application window without ghosting**, the panels run as `own_window_type = 'normal'` with the `below` state plus `skip_taskbar` / `skip_pager` / `sticky` / `undecorated` hints — KWin treats them as ordinary managed windows so damage / expose events repaint them cleanly when overlapping windows move, while the `below` state guarantees no real window is ever covered. Panels also set `own_window_class = 'PlasmaColorizerConky'` so you can target them with a custom KWin window rule if your setup ever needs one.
 - Fetch helpers for Conky `execi` (also useful from a terminal):
 
   ```bash

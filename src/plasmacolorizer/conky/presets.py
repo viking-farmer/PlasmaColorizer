@@ -7,6 +7,8 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -258,6 +260,71 @@ def stop_preset(preset_id: str) -> tuple[bool, str]:
     return True, f"stopped pid {pid}"
 
 
+def _opacity_to_cardinal(opacity: float) -> int:
+    """Convert ``[0.0, 1.0]`` opacity into the 32-bit ``_NET_WM_WINDOW_OPACITY`` cardinal."""
+    return int(round(max(0.0, min(1.0, float(opacity))) * 0xFFFFFFFF))
+
+
+def _apply_window_opacity(
+    window_title: str,
+    opacity: float,
+    *,
+    timeout_s: float = 4.0,
+    interval_s: float = 0.15,
+) -> None:
+    """Set ``_NET_WM_WINDOW_OPACITY`` on the named X11 window via ``xprop``.
+
+    On KWin/Wayland (XWayland) the compositor often ignores Conky's
+    ``own_window_argb_value`` even though the 32-bit visual is selected, so
+    the panel ends up opaque regardless of the slider. ``_NET_WM_WINDOW_OPACITY``
+    is the universal compositor opacity hint (KWin and Picom both honour it),
+    so we apply it on top of the ARGB visual for reliable see-through panels.
+
+    Runs in a daemon thread that retries until the window is mapped or
+    ``timeout_s`` elapses, so callers never block on ``conky`` startup.
+    Silently no-ops if ``xprop`` is missing or no X display is reachable.
+    """
+    cardinal = _opacity_to_cardinal(opacity)
+    xprop = which("xprop")
+    if not xprop:
+        return
+
+    def _worker() -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                r = subprocess.run(
+                    [
+                        xprop, "-name", window_title,
+                        "-f", "_NET_WM_WINDOW_OPACITY", "32c",
+                        "-set", "_NET_WM_WINDOW_OPACITY", str(cardinal),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return
+            if r.returncode == 0:
+                return
+            time.sleep(interval_s)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def apply_panel_opacity_to_running(opacity: float | None = None) -> None:
+    """Push the current transparency setting to every running bundled Conky.
+
+    Useful when the slider changes but a full re-render/restart is overkill —
+    KWin honours the new ``_NET_WM_WINDOW_OPACITY`` value live.
+    """
+    if opacity is None:
+        opacity = load_conky_settings().conky_panel_opacity
+    for pid, meta in PRESETS.items():
+        if is_preset_running(pid):
+            _apply_window_opacity(meta.window_title, opacity)
+
+
 def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
     """Spawn a Conky process for ``cfg`` and record its pid (no ``-d`` so PID stays valid)."""
     bin_path = conky_binary()
@@ -276,6 +343,12 @@ def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
     except OSError as exc:
         return False, str(exc)
     _pid_file(preset_id).write_text(str(proc.pid), encoding="utf-8")
+    # Conky's own ARGB visual is unreliable under XWayland/KWin, so push the
+    # universal _NET_WM_WINDOW_OPACITY hint as soon as the window is mapped.
+    _apply_window_opacity(
+        PRESETS[preset_id].window_title,
+        load_conky_settings().conky_panel_opacity,
+    )
     return True, f"started pid {proc.pid} ({cfg})"
 
 

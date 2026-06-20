@@ -9,7 +9,7 @@ resolve the wallpaper) or after it finishes (to notify running apps).
 Only deterministic, thread-safe work runs here:
 
   1. quantize the wallpaper image into a seed color (materialyoucolor),
-  2. apply the optional green accent bias,
+  2. apply the optional primary color bias,
   3. build a full Material You palette,
   4. optionally write the ``.colors`` file, ``kdeglobals``, and desktop theme
      (see ``plasma_scheme.apply_material_palette_to_disk``).
@@ -45,12 +45,12 @@ class WorkerResult:
 def compute_material_palette_from_wallpaper(
     *,
     src_path: str,
-    green_strength: float,
+    primary_bias_strength: float,
     dark: bool | None,
     quality: int,
     log=None,
 ) -> MaterialPalette:
-    """Quantize image, optional green bias, build Material You palette (no disk writes)."""
+    """Quantize image, optional primary bias, build Material You palette (no disk writes)."""
     log = log or get_logger()
     src = src_path
     if not Path(src).is_file():
@@ -60,14 +60,14 @@ def compute_material_palette_from_wallpaper(
     seed = pal.seed_color_from_image(src, quality=quality)
     log.debug("seed argb = 0x%08x", seed)
 
-    if green_strength > 0:
-        seed = pal.apply_green_bias(seed, green_strength)
-        log.debug("seed after green bias = 0x%08x", seed)
-
     if dark is None:
         dark = kde_prefs.is_plasma_dark_scheme_preferred()
     else:
         dark = bool(dark)
+
+    if primary_bias_strength > 0:
+        seed = pal.apply_primary_bias(seed, primary_bias_strength, dark=dark)
+        log.debug("seed after primary bias = 0x%08x", seed)
 
     return pal.build_palette(seed, dark=dark)
 
@@ -83,13 +83,13 @@ class PreviewPaletteWorker(QObject):
         self,
         *,
         src_path: str,
-        green_strength: float,
+        primary_bias_strength: float,
         dark: bool | None,
         quality: int,
     ) -> None:
         super().__init__()
         self._src_path = src_path
-        self._green = green_strength
+        self._primary_bias = primary_bias_strength
         self._dark = dark
         self._quality = quality
         self._log = get_logger()
@@ -103,8 +103,8 @@ class PreviewPaletteWorker(QObject):
         try:
             self._emit(f"Source image: {self._src_path}")
             self._emit(f"Quantizing image (quality={self._quality})...")
-            if self._green > 0:
-                self._emit(f"Applying green accent bias ({self._green * 100:.0f}%)...")
+            if self._primary_bias > 0:
+                self._emit(f"Applying primary color bias ({self._primary_bias * 100:.0f}%)...")
             if self._dark is None:
                 self._emit("Resolving dark/light from KDE preferences…")
             else:
@@ -112,7 +112,7 @@ class PreviewPaletteWorker(QObject):
             self._emit("Building Material You palette…")
             mpl = compute_material_palette_from_wallpaper(
                 src_path=self._src_path,
-                green_strength=self._green,
+                primary_bias_strength=self._primary_bias,
                 dark=self._dark,
                 quality=self._quality,
                 log=log,
@@ -202,7 +202,7 @@ class GenerateSchemeWorker(QObject):
         self,
         *,
         src_path: str,
-        green_strength: float,
+        primary_bias_strength: float,
         dark: bool | None,
         quality: int,
         choices: SchemeApplyChoices | None = None,
@@ -210,7 +210,7 @@ class GenerateSchemeWorker(QObject):
     ) -> None:
         super().__init__()
         self._src_path = src_path
-        self._green = green_strength
+        self._primary_bias = primary_bias_strength
         self._dark = dark
         self._quality = quality
         self._choices = choices
@@ -226,8 +226,8 @@ class GenerateSchemeWorker(QObject):
         try:
             self._emit(f"Source image: {self._src_path}")
             self._emit(f"Quantizing image (quality={self._quality})...")
-            if self._green > 0:
-                self._emit(f"Applying green accent bias ({self._green * 100:.0f}%)...")
+            if self._primary_bias > 0:
+                self._emit(f"Applying primary color bias ({self._primary_bias * 100:.0f}%)...")
             if self._dark is None:
                 dark = kde_prefs.is_plasma_dark_scheme_preferred()
                 self._emit(f"Dark mode (follow KDE): {dark}")
@@ -238,7 +238,7 @@ class GenerateSchemeWorker(QObject):
             self._emit("Building Material You palette...")
             mpl = compute_material_palette_from_wallpaper(
                 src_path=self._src_path,
-                green_strength=self._green,
+                primary_bias_strength=self._primary_bias,
                 dark=self._dark,
                 quality=self._quality,
                 log=log,

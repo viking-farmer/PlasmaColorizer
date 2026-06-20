@@ -1,5 +1,10 @@
 from plasmacolorizer.conky.templating import context_from_palette, render_template
-from plasmacolorizer.core.palette import MaterialPalette, apply_green_bias, rgb_tuple_to_argb_u
+from plasmacolorizer.core.palette import (
+    MaterialPalette,
+    apply_primary_bias,
+    build_palette,
+    rgb_tuple_to_argb_u,
+)
 
 
 def test_render_template_basic() -> None:
@@ -13,12 +18,20 @@ def test_rgb_tuple_to_argb_u() -> None:
     assert rgb_tuple_to_argb_u((10, 20, 30)) == 0xFF0A141E
 
 
-def test_green_bias_limits() -> None:
+def test_primary_bias_limits() -> None:
     mid = 0xFF5555AA
-    assert apply_green_bias(mid, 0.0) == mid
-    a = apply_green_bias(mid, 1.0)
-    b = apply_green_bias(mid, 1.0)
+    assert apply_primary_bias(mid, 0.0, dark=True) == mid
+    a = apply_primary_bias(mid, 1.0, dark=True)
+    b = apply_primary_bias(mid, 1.0, dark=True)
     assert a == b
+
+
+def test_primary_bias_moves_toward_scheme_primary() -> None:
+    seed = 0xFF5533AA
+    biased = apply_primary_bias(seed, 1.0, dark=True)
+    pal = build_palette(seed, dark=True)
+    target = rgb_tuple_to_argb_u(pal.colors["primary"])
+    assert biased == target
 
 
 def test_context_from_palette_has_snake_case() -> None:

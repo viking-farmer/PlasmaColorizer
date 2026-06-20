@@ -44,9 +44,6 @@ def merge_palette_color_overrides(
         return out
 
 
-GREEN_TARGET_HUE = 125.0
-
-
 def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
     r, g, b = rgb
     return f"#{r:02x}{g:02x}{b:02x}"
@@ -73,14 +70,24 @@ def seed_color_from_image(path: str, quality: int = 4) -> int:
     return int(ranked)
 
 
-def apply_green_bias(argb: int, strength: float) -> int:
-    """Blend hue toward green; strength in [0, 1]."""
+def apply_primary_bias(argb: int, strength: float, *, dark: bool) -> int:
+    """Blend seed HCT toward the Material ``primary`` derived from that seed.
+
+    Unlike a fixed hue target (e.g. green), this nudges the wallpaper seed toward
+    the accent colour the tonal-spot scheme would assign as ``primary`` for the
+    chosen light/dark mode — keeping accents wallpaper-driven while making them
+    more pronounced at higher slider values.
+    """
     if strength <= 0.0:
         return argb
     s = min(1.0, max(0.0, float(strength)))
-    h = Hct.from_int(argb)
-    new_h = h.hue + (GREEN_TARGET_HUE - h.hue) * s
-    adjusted = Hct.from_hct(new_h, h.chroma, h.tone)
+    pal = build_palette(argb, dark=dark)
+    target = Hct.from_int(rgb_tuple_to_argb_u(pal.colors["primary"]))
+    src = Hct.from_int(argb)
+    new_h = src.hue + (target.hue - src.hue) * s
+    new_c = src.chroma + (target.chroma - src.chroma) * s
+    new_t = src.tone + (target.tone - src.tone) * s
+    adjusted = Hct.from_hct(new_h, new_c, new_t)
     return int(adjusted.to_int())
 
 

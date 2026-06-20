@@ -65,7 +65,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Initial release.
 - Detect wallpaper via `org.kde.PlasmaShell` (DBus).
 - Material You palette extraction via `materialyoucolor`.
-- Optional green-accent hue bias.
+- Optional primary-color accent bias.
 - Write Plasma color scheme to
   `~/.local/share/color-schemes/PlasmaColorizer.colors`.
 - Conky template tab with `{{token}}` rendering.
