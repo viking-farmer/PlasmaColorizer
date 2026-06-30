@@ -4,8 +4,10 @@ PyQt6 utility for **KDE Plasma** (Manjaro-friendly) that:
 
 - Reads the active wallpaper via **`org.kde.PlasmaShell`** (DBus).
 - Extracts a seed color with **materialyoucolor** and builds a Material You–style palette.
-- Writes `~/.local/share/color-schemes/PlasmaColorizer.colors`, merges into `~/.config/kdeglobals`, and refreshes Plasma accent (see app sources).
-- Optional **primary color bias** (nudges the wallpaper seed toward the Material primary accent before scheme generation).
+- Writes `~/.local/share/color-schemes/PlasmaColorizer.colors`, merges into `~/.config/kdeglobals`, installs a **Plasma desktop theme** (`PlasmaColorizer`), and reloads it via `plasma-apply-desktoptheme` plus DBus accent sync.
+- **KDE panel opacity** mode on the Colorizer tab (Solid / Adaptive / Translucent — Plasma 6’s real API in `~/.config/plasmashellrc`; Solid by default so scheme colours show on the taskbar).
+- Optional **component colour overrides** — pin panel, launcher, selection, etc. to palette swatches or a custom colour / screen dropper without replacing automated mapping.
+- Optional **strong panel tint** and **primary color bias** for more visible wallpaper-driven accents.
 - Offers a **Conky** tab with **bundled presets** (system stats, shortcuts, ESV verse, Open-Meteo weather) plus custom `{{token}}` templates filled from the palette.
 
 ## Requirements

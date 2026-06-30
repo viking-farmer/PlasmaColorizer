@@ -27,6 +27,7 @@ from plasmacolorizer.core import kde_prefs
 from plasmacolorizer.core import palette as pal
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core.logger import get_logger
+from plasmacolorizer.core.app_settings import AppSettings
 from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_overrides
 from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
 
@@ -138,11 +139,13 @@ class ApplyPaletteWorker(QObject):
         src_path: str,
         palette: MaterialPalette,
         choices: SchemeApplyChoices | None,
+        app_settings: AppSettings | None = None,
     ) -> None:
         super().__init__()
         self._src = src_path
         self._palette = palette
         self._choices = choices
+        self._app_settings = app_settings
         self._log = get_logger()
 
     def _emit(self, msg: str) -> None:
@@ -153,7 +156,9 @@ class ApplyPaletteWorker(QObject):
         log.info("ApplyPaletteWorker.run() started")
         try:
             self._emit("Writing Plasma .colors file and kdeglobals…")
-            disk = plasma_scheme.apply_material_palette_to_disk(self._palette, self._choices)
+            disk = plasma_scheme.apply_material_palette_to_disk(
+                self._palette, self._choices, app_settings=self._app_settings,
+            )
             if not disk.apply_ok:
                 self._emit(f"kdeglobals write failed: {disk.apply_error}")
                 self.finished.emit(WorkerResult(
@@ -207,6 +212,7 @@ class GenerateSchemeWorker(QObject):
         quality: int,
         choices: SchemeApplyChoices | None = None,
         swatch_overrides: dict[str, tuple[int, int, int]] | None = None,
+        app_settings: AppSettings | None = None,
     ) -> None:
         super().__init__()
         self._src_path = src_path
@@ -215,6 +221,7 @@ class GenerateSchemeWorker(QObject):
         self._quality = quality
         self._choices = choices
         self._swatch_overrides = dict(swatch_overrides) if swatch_overrides else {}
+        self._app_settings = app_settings
         self._log = get_logger()
 
     def _emit(self, msg: str) -> None:
@@ -248,7 +255,9 @@ class GenerateSchemeWorker(QObject):
                 self._emit("Applied manual swatch overrides before writing scheme.")
 
             self._emit("Writing Plasma .colors file and kdeglobals…")
-            disk = plasma_scheme.apply_material_palette_to_disk(mpl, self._choices)
+            disk = plasma_scheme.apply_material_palette_to_disk(
+                mpl, self._choices, app_settings=self._app_settings,
+            )
             if not disk.apply_ok:
                 self._emit(disk.apply_error)
                 self.finished.emit(WorkerResult(

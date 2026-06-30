@@ -43,9 +43,22 @@ from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_setti
 from plasmacolorizer.conky.templating import render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
+from plasmacolorizer.core.app_settings import AppSettings, load_app_settings, save_app_settings
+from plasmacolorizer.core.component_colors import (
+    COMPONENT_BY_ID,
+    PLASMA_COMPONENTS,
+    ComponentColorOverride,
+    apply_component_color_overrides,
+    component_tooltip,
+    effective_component_rgb,
+    overrides_from_settings_dict,
+    overrides_to_settings_dict,
+    resolve_override_rgb,
+)
 from plasmacolorizer.core.logger import get_logger, log_file_path
 from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_overrides, rgb_to_hex
-from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices
+from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices, str_to_panel_opacity_mode
+from plasmacolorizer.ui.component_color_dialog import ComponentColorDialog
 from plasmacolorizer.workers import (
     ApplyPaletteWorker,
     GeocodeSearchWorker,
@@ -70,6 +83,7 @@ class MainWindow(QMainWindow):
 
         self._last_palette: MaterialPalette | None = None
         self._swatch_overrides: dict[str, tuple[int, int, int]] = {}
+        self._component_overrides: dict[str, ComponentColorOverride] = {}
         self._last_wallpaper_src: str = ""
         self._thread: QThread | None = None
         self._worker: QObject | None = None
@@ -224,6 +238,85 @@ class MainWindow(QMainWindow):
         map_form.addRow("Application links", self._links_combo)
         scheme_layout.addLayout(map_form)
 
+        self._component_colors_toggle = QCheckBox("Show component color overrides (optional)")
+        self._component_colors_toggle.setToolTip(
+            "Pin specific KDE roles (panel, launcher, selection, etc.) to palette colours or "
+            "a custom pick. Automated mapping still applies everywhere you do not override."
+        )
+        scheme_layout.addWidget(self._component_colors_toggle)
+
+        self._component_colors_container = QWidget()
+        comp_layout = QVBoxLayout(self._component_colors_container)
+        comp_layout.setContentsMargins(0, 0, 0, 0)
+        comp_hint = QLabel(
+            "Click a swatch to pick from the generated palette or use a custom colour / screen dropper. "
+            "Overrides persist across applies; Reset returns that role to automated mapping."
+        )
+        comp_hint.setWordWrap(True)
+        comp_layout.addWidget(comp_hint)
+
+        self._component_buttons: dict[str, QToolButton] = {}
+        self._component_reset_buttons: dict[str, QPushButton] = {}
+        comp_form = QFormLayout()
+        for comp in PLASMA_COMPONENTS:
+            row = QHBoxLayout()
+            btn = QToolButton()
+            btn.setMinimumSize(48, 28)
+            btn.setAutoRaise(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, cid=comp.id: self._edit_component_color(cid))
+            self._component_buttons[comp.id] = btn
+            row.addWidget(btn)
+            reset = QPushButton("Reset")
+            reset.setObjectName("secondary")
+            reset.setMaximumWidth(72)
+            reset.setEnabled(False)
+            reset.clicked.connect(lambda checked=False, cid=comp.id: self._reset_component_color(cid))
+            self._component_reset_buttons[comp.id] = reset
+            row.addWidget(reset)
+            row.addStretch(1)
+            comp_form.addRow(comp.label, row)
+        comp_layout.addLayout(comp_form)
+
+        reset_all_comp = QPushButton("Reset all component overrides")
+        reset_all_comp.setObjectName("secondary")
+        reset_all_comp.clicked.connect(self._reset_all_component_colors)
+        comp_layout.addWidget(reset_all_comp)
+        self._component_colors_container.setVisible(False)
+        self._component_colors_toggle.toggled.connect(self._component_colors_container.setVisible)
+        scheme_layout.addWidget(self._component_colors_container)
+
+        self._plasma_strong_panel_tint = QCheckBox("Strong panel tint (primaryContainer backgrounds)")
+        self._plasma_strong_panel_tint.setToolTip(
+            "Tints the KDE taskbar / panel background toward the palette primary container colour "
+            "so applied colours are more visible than the default neutral surface tones."
+        )
+        scheme_layout.addWidget(self._plasma_strong_panel_tint)
+
+        self._plasma_panel_opacity_combo = QComboBox()
+        for label, mode in (
+            ("Solid (recommended)", "opaque"),
+            ("Adaptive (opaque when window touches panel)", "adaptive"),
+            ("Translucent (wallpaper shows through)", "translucent"),
+        ):
+            self._plasma_panel_opacity_combo.addItem(label, mode)
+        self._plasma_panel_opacity_combo.setToolTip(
+            "Plasma 6 panel opacity mode (not partial alpha like Conky). "
+            "Solid keeps scheme colours visible on the taskbar."
+        )
+        self._plasma_panel_opacity_combo.currentIndexChanged.connect(
+            self._on_plasma_panel_opacity_mode_changed,
+        )
+        opacity_form = QFormLayout()
+        opacity_form.addRow("Panel opacity", self._plasma_panel_opacity_combo)
+        scheme_layout.addLayout(opacity_form)
+        plasma_opacity_hint = QLabel(
+            "Plasma 6 supports three panel modes (Solid / Adaptive / Translucent), not a continuous "
+            "transparency slider."
+        )
+        plasma_opacity_hint.setWordWrap(True)
+        scheme_layout.addWidget(plasma_opacity_hint)
+
         scheme_box.setLayout(scheme_layout)
         layout.addWidget(scheme_box)
 
@@ -302,7 +395,61 @@ class MainWindow(QMainWindow):
             f"  - A detailed log is written to {self._log_file}"
         )
         self._clear_swatches()
+        self._load_app_settings_to_ui()
+        self._update_component_color_swatches()
         return outer
+
+    def _plasma_panel_opacity_mode_from_ui(self) -> str:
+        mode = self._plasma_panel_opacity_combo.currentData()
+        return str(mode) if mode else "opaque"
+
+    def _set_plasma_panel_opacity_combo(self, mode: str) -> None:
+        target = mode.strip().lower()
+        self._plasma_panel_opacity_combo.blockSignals(True)
+        for i in range(self._plasma_panel_opacity_combo.count()):
+            if self._plasma_panel_opacity_combo.itemData(i) == target:
+                self._plasma_panel_opacity_combo.setCurrentIndex(i)
+                break
+        self._plasma_panel_opacity_combo.blockSignals(False)
+
+    def _on_plasma_panel_opacity_mode_changed(self, _index: int) -> None:
+        self._save_app_settings_from_ui()
+        mode = str_to_panel_opacity_mode(self._plasma_panel_opacity_mode_from_ui())
+        try:
+            plasma_scheme.apply_plasma_panel_opacity_mode(mode)
+            ok, msg = plasma_scheme.reload_plasma_panel_config()
+            self._append_log(
+                f"Panel opacity → {plasma_scheme.panel_opacity_mode_to_str(mode)} "
+                f"({int(mode)}); {msg}",
+            )
+            if not ok:
+                self._append_log("Note: panel may need a plasmashell restart to update visually.")
+        except OSError as exc:
+            self._append_log(f"Panel opacity write failed: {exc}")
+
+    def _load_app_settings_to_ui(self) -> None:
+        app = load_app_settings()
+        sys_mode = plasma_scheme.read_plasma_panel_opacity_mode()
+        mode = app.plasma_panel_opacity_mode
+        if sys_mode is not None:
+            mode = plasma_scheme.panel_opacity_mode_to_str(sys_mode)
+        self._plasma_strong_panel_tint.setChecked(app.plasma_strong_panel_tint)
+        self._set_plasma_panel_opacity_combo(mode)
+        self._component_overrides = overrides_from_settings_dict(app.plasma_component_colors)
+        if self._component_overrides:
+            self._component_colors_toggle.setChecked(True)
+
+    def _app_settings_from_ui(self) -> AppSettings:
+        prev = load_app_settings()
+        return AppSettings(
+            plasma_fallback_theme_id=prev.plasma_fallback_theme_id,
+            plasma_panel_opacity_mode=self._plasma_panel_opacity_mode_from_ui(),
+            plasma_strong_panel_tint=self._plasma_strong_panel_tint.isChecked(),
+            plasma_component_colors=overrides_to_settings_dict(self._component_overrides),
+        )
+
+    def _save_app_settings_from_ui(self) -> None:
+        save_app_settings(self._app_settings_from_ui())
 
     def _dark_choice(self) -> bool | None:
         idx = self._dark_combo.currentIndex()
@@ -316,6 +463,7 @@ class MainWindow(QMainWindow):
             accent=str(ac) if ac is not None else "primary",
             emphasis=str(em) if em is not None else "secondary",
             links=li if isinstance(li, str) else None,
+            strong_panel_tint=self._plasma_strong_panel_tint.isChecked(),
         )
 
     def _effective_palette(self) -> MaterialPalette | None:
@@ -350,6 +498,98 @@ class MainWindow(QMainWindow):
                 "border-radius: 6px; }}"
             )
 
+    def _refresh_color_previews(self, pal: MaterialPalette | None = None) -> None:
+        self._update_palette_swatches(pal)
+        self._update_component_color_swatches()
+
+    def _effective_scheme_sections(self) -> dict[str, dict[str, str]] | None:
+        eff = self._effective_palette()
+        if eff is None:
+            return None
+        sections = plasma_scheme.build_color_sections(eff, self._scheme_choices())
+        return apply_component_color_overrides(
+            sections,
+            self._component_overrides,
+            palette=eff,
+        )
+
+    def _update_component_color_swatches(self) -> None:
+        eff = self._effective_palette()
+        sections = None
+        if eff is not None:
+            sections = plasma_scheme.build_color_sections(eff, self._scheme_choices())
+        for comp in PLASMA_COMPONENTS:
+            btn = self._component_buttons.get(comp.id)
+            reset = self._component_reset_buttons.get(comp.id)
+            if btn is None:
+                continue
+            override = self._component_overrides.get(comp.id)
+            if override is not None and eff is not None:
+                rgb = resolve_override_rgb(override, eff)
+            elif sections is not None and eff is not None:
+                rgb = effective_component_rgb(comp.id, sections, eff)
+            else:
+                rgb = None
+            if rgb is None:
+                btn.setStyleSheet(
+                    "QToolButton { background: #2a2a32; border: 1px solid #444; border-radius: 6px; }"
+                )
+                btn.setToolTip(component_tooltip(comp.id, sections=sections, palette=eff, override=override))
+            else:
+                hx = rgb_to_hex(rgb)
+                border = "#c9a227" if override is not None else "#555"
+                btn.setStyleSheet(
+                    f"QToolButton {{ background-color: {hx}; border: 2px solid {border}; "
+                    "border-radius: 6px; }}"
+                )
+                btn.setToolTip(component_tooltip(comp.id, sections=sections, palette=eff, override=override))
+            if reset is not None:
+                reset.setEnabled(override is not None)
+
+    def _edit_component_color(self, comp_id: str) -> None:
+        comp = COMPONENT_BY_ID.get(comp_id)
+        eff = self._effective_palette()
+        if comp is None or eff is None:
+            QMessageBox.information(
+                self,
+                "Component colors",
+                "Preview a palette first, then you can override individual component colours.",
+            )
+            return
+        dlg = ComponentColorDialog(
+            self,
+            component=comp,
+            palette=eff,
+            current=self._component_overrides.get(comp_id),
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dlg.selected_override()
+        if chosen is None:
+            return
+        self._component_overrides[comp_id] = chosen
+        self._save_app_settings_from_ui()
+        self._update_component_color_swatches()
+        self._append_log(f"Component override: {comp.label} ({chosen.source})")
+
+    def _reset_component_color(self, comp_id: str) -> None:
+        if comp_id not in self._component_overrides:
+            return
+        comp = COMPONENT_BY_ID.get(comp_id)
+        del self._component_overrides[comp_id]
+        self._save_app_settings_from_ui()
+        self._update_component_color_swatches()
+        label = comp.label if comp else comp_id
+        self._append_log(f"Component {label} reset to automated mapping.")
+
+    def _reset_all_component_colors(self) -> None:
+        if not self._component_overrides:
+            return
+        self._component_overrides.clear()
+        self._save_app_settings_from_ui()
+        self._update_component_color_swatches()
+        self._append_log("All component colour overrides cleared.")
+
     def _edit_swatch_color(self, key: str) -> None:
         eff = self._effective_palette()
         if eff is None:
@@ -365,7 +605,7 @@ class MainWindow(QMainWindow):
         if not chosen.isValid():
             return
         self._swatch_overrides[key] = (chosen.red(), chosen.green(), chosen.blue())
-        self._update_palette_swatches()
+        self._refresh_color_previews()
         self._append_log(f"Swatch override {key}={rgb_to_hex(self._swatch_overrides[key])}")
 
     def _on_swatch_context_menu(self, key: str, global_pos: QPoint) -> None:
@@ -374,7 +614,7 @@ class MainWindow(QMainWindow):
         chosen = menu.exec(global_pos)
         if chosen is reset_one and key in self._swatch_overrides:
             del self._swatch_overrides[key]
-            self._update_palette_swatches()
+            self._refresh_color_previews()
             self._append_log(f"Swatch {key} reset to generated palette.")
 
     def _on_reset_swatches(self) -> None:
@@ -382,9 +622,10 @@ class MainWindow(QMainWindow):
             return
         self._swatch_overrides.clear()
         if self._last_palette is not None:
-            self._update_palette_swatches(self._last_palette)
+            self._refresh_color_previews(self._last_palette)
         else:
             self._clear_swatches()
+            self._update_component_color_swatches()
         self._append_log("All swatch overrides cleared.")
 
     def _set_color_tab_busy(self, running: bool) -> None:
@@ -503,6 +744,7 @@ class MainWindow(QMainWindow):
         self._swatch_overrides.clear()
         self._last_palette = pal
         self._update_palette_swatches(pal)
+        self._update_component_color_swatches()
         pri = pal.colors.get("primary", (0, 0, 0))
         self._append_log(
             f"Preview ready: primary={rgb_to_hex(pri)}, dark={pal.is_dark}. "
@@ -529,6 +771,7 @@ class MainWindow(QMainWindow):
             return
 
         self._set_color_tab_busy(True)
+        self._save_app_settings_from_ui()
         self._append_log("Applying palette to Plasma files (respecting mapping choices)…")
 
         busy = QProgressDialog(self)
@@ -550,6 +793,7 @@ class MainWindow(QMainWindow):
             src_path=src,
             palette=pal_apply,
             choices=self._scheme_choices(),
+            app_settings=self._app_settings_from_ui(),
         )
         self._thread = thread
         self._worker = worker
@@ -581,6 +825,7 @@ class MainWindow(QMainWindow):
         self._last_wallpaper_src = src
 
         self._set_color_tab_busy(True)
+        self._save_app_settings_from_ui()
         self._append_log("Generating: quantize, build palette, write .colors, update kdeglobals.")
 
         busy = QProgressDialog(self)
@@ -605,6 +850,7 @@ class MainWindow(QMainWindow):
             quality=self._quality.value(),
             choices=self._scheme_choices(),
             swatch_overrides=dict(self._swatch_overrides),
+            app_settings=self._app_settings_from_ui(),
         )
         # CRITICAL: keep strong references to BOTH thread and worker. Without
         # self._worker, the local `worker` is garbage-collected the moment
@@ -641,6 +887,7 @@ class MainWindow(QMainWindow):
         self._swatch_overrides.clear()
         self._path_display.setText(str(result.src))
         self._update_palette_swatches(result.palette)
+        self._update_component_color_swatches()
         pri = result.palette.colors.get("primary", (0, 0, 0))
         self._append_log(f"Palette ready: primary={rgb_to_hex(pri)}, dark={result.palette.is_dark}")
         self._refresh_running_conkys()
@@ -658,7 +905,10 @@ class MainWindow(QMainWindow):
             return
 
         # kdeglobals write succeeded; push palette to KWin, shell, and global accent (main thread).
-        self._append_log("DBus: KWin + PlasmaShell + plasmashell.accentColor…")
+        app = self._app_settings_from_ui()
+        for note in plasma_scheme.collect_apply_diagnostics(app):
+            self._append_log(f"Note: {note}")
+        self._append_log("Reloading Plasma Style + DBus: KWin, PlasmaShell, accentColor…")
         notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(
             result.palette,
             timeout=2.0,
@@ -667,7 +917,7 @@ class MainWindow(QMainWindow):
         self._append_log(notify_msg)
 
         restarted = False
-        if self._restart_plasma.isChecked():
+        if self._restart_plasma.isChecked() or app.plasma_panel_opacity_mode != "opaque":
             self._append_log("Restarting plasmashell (full panel / launcher reload)…")
             rs_ok, rs_msg = plasma_scheme.restart_plasmashell()
             self._append_log(rs_msg)

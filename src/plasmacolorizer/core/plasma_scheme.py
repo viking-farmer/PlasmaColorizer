@@ -25,15 +25,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import textwrap
 import time
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 
 from materialyoucolor.dynamiccolor.color_spec import COLOR_NAMES
 
+from plasmacolorizer.core.app_settings import AppSettings, load_app_settings, save_app_settings
+from plasmacolorizer.core.component_colors import (
+    ComponentColorOverride,
+    apply_component_color_overrides as _apply_component_color_overrides,
+    overrides_from_settings_dict,
+)
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex, rgb_tuple_to_argb_u
 
 _MATERIAL_NAMES = frozenset(COLOR_NAMES)
@@ -53,6 +61,8 @@ class SchemeApplyChoices:
     emphasis: str = "secondary"
     #: When set, ``Colors:View`` link + visited foregrounds both use this Material token.
     links: str | None = None
+    #: Use ``primaryContainer`` for panel/window backgrounds (stronger visible tint).
+    strong_panel_tint: bool = False
 
 
 def normalize_scheme_apply_choices(ch: SchemeApplyChoices | None) -> SchemeApplyChoices:
@@ -61,7 +71,9 @@ def normalize_scheme_apply_choices(ch: SchemeApplyChoices | None) -> SchemeApply
     a = ch.accent if ch.accent in _ALLOWED_ACCENT else "primary"
     e = ch.emphasis if ch.emphasis in _ALLOWED_EMPHASIS else "secondary"
     ln = ch.links if (ch.links is None or ch.links in _ALLOWED_LINKS) else None
-    return SchemeApplyChoices(accent=a, emphasis=e, links=ln)
+    return SchemeApplyChoices(
+        accent=a, emphasis=e, links=ln, strong_panel_tint=bool(ch.strong_panel_tint),
+    )
 
 
 def _accent_family_tokens(accent: str) -> tuple[str, str, str]:
@@ -211,6 +223,211 @@ def kdeglobals_path() -> Path:
     return Path(os.path.expanduser("~/.config/kdeglobals"))
 
 
+def plasmashellrc_path() -> Path:
+    return Path(os.path.expanduser("~/.config/plasmashellrc"))
+
+
+def plasma_appletsrc_path() -> Path:
+    return Path(os.path.expanduser("~/.config/plasma-org.kde.plasma.desktop-appletsrc"))
+
+
+def kde_material_you_colors_config() -> Path:
+    return Path(os.path.expanduser("~/.config/kde-material-you-colors/config.conf"))
+
+
+def kdedefaults_path() -> Path:
+    return Path(os.path.expanduser("~/.config/kdedefaults/kdeglobals"))
+
+
+_PANEL_SECTION_RE = re.compile(r"^\[PlasmaViews\]\[Panel \d+\]$")
+
+
+class PanelOpacityMode(IntEnum):
+    """Plasma 6 ``panelOpacity`` in ``plasmashellrc`` — integer mode, not alpha."""
+
+    ADAPTIVE = 0
+    OPAQUE = 1
+    TRANSLUCENT = 2
+
+
+_PANEL_OPACITY_MODE_LABELS: dict[PanelOpacityMode, str] = {
+    PanelOpacityMode.ADAPTIVE: "adaptive",
+    PanelOpacityMode.OPAQUE: "opaque",
+    PanelOpacityMode.TRANSLUCENT: "translucent",
+}
+
+
+def panel_opacity_mode_to_str(mode: PanelOpacityMode) -> str:
+    return _PANEL_OPACITY_MODE_LABELS.get(mode, "opaque")
+
+
+def str_to_panel_opacity_mode(value: str) -> PanelOpacityMode:
+    key = (value or "").strip().lower()
+    for mode, label in _PANEL_OPACITY_MODE_LABELS.items():
+        if label == key:
+            return mode
+    return PanelOpacityMode.OPAQUE
+
+
+def _parse_panel_opacity_raw(raw: str) -> PanelOpacityMode | None:
+    """Parse ``panelOpacity`` value — int mode (Plasma 6) or legacy float."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        if "." in raw:
+            fval = float(raw)
+            if fval >= 1.0:
+                return PanelOpacityMode.OPAQUE
+            if fval <= 0.0:
+                return PanelOpacityMode.TRANSLUCENT
+            return PanelOpacityMode.ADAPTIVE
+        ival = int(raw)
+        if ival in (0, 1, 2):
+            return PanelOpacityMode(ival)
+    except ValueError:
+        pass
+    return None
+
+
+def read_plasma_panel_opacity_mode() -> PanelOpacityMode | None:
+    """Return the minimum opacity mode across all panels (``None`` if unset)."""
+    path = plasmashellrc_path()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    modes: list[PanelOpacityMode] = []
+    in_panel = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if _PANEL_SECTION_RE.match(stripped):
+            in_panel = True
+            continue
+        if stripped.startswith("[") and in_panel:
+            in_panel = False
+        if in_panel and stripped.lower().startswith("panelopacity="):
+            parsed = _parse_panel_opacity_raw(stripped.split("=", 1)[1])
+            if parsed is not None:
+                modes.append(parsed)
+    if not modes:
+        return None
+    return min(modes, key=lambda m: int(m))
+
+
+def apply_plasma_panel_opacity_mode(mode: PanelOpacityMode) -> Path:
+    """Write integer ``panelOpacity`` mode into every ``[PlasmaViews][Panel N]`` block."""
+    opacity_s = str(int(mode))
+    path = plasmashellrc_path()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        text = ""
+    lines = text.splitlines(keepends=True) if text else []
+    out: list[str] = []
+    in_panel = False
+    has_opacity = False
+    for line in lines:
+        stripped = line.strip()
+        if _PANEL_SECTION_RE.match(stripped):
+            if in_panel and not has_opacity:
+                out.append(f"panelOpacity={opacity_s}\n")
+            in_panel = True
+            has_opacity = False
+            out.append(line)
+            continue
+        if stripped.startswith("[") and in_panel:
+            if not has_opacity:
+                out.append(f"panelOpacity={opacity_s}\n")
+            in_panel = False
+            has_opacity = False
+        if in_panel and stripped.lower().startswith("panelopacity="):
+            out.append(f"panelOpacity={opacity_s}\n")
+            has_opacity = True
+            continue
+        out.append(line)
+    if in_panel and not has_opacity:
+        out.append(f"panelOpacity={opacity_s}\n")
+    new_text = "".join(out)
+    if not new_text.endswith("\n") and new_text:
+        new_text += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".plasmacolorizer.tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def reload_plasma_panel_config(*, restart_timeout_s: float = 25.0) -> tuple[bool, str]:
+    """Ask plasmashell to reload panel config; restart if DBus refresh is unavailable."""
+    try:
+        import dbus  # type: ignore
+
+        bus = dbus.SessionBus()
+        shell = bus.get_object("org.kde.plasmashell", "/PlasmaShell")
+        dbus.Interface(shell, "org.kde.PlasmaShell").refreshCurrentShell()
+        return True, "PlasmaShell.refreshCurrentShell OK"
+    except Exception as exc:  # noqa: BLE001
+        ok, msg = restart_plasmashell(quit_timeout_s=restart_timeout_s)
+        if ok:
+            return True, f"DBus refresh failed ({exc}); {msg}"
+        return False, f"DBus refresh failed ({exc}); restart failed: {msg}"
+
+
+def capture_plasma_fallback_theme(app: AppSettings) -> AppSettings:
+    """Remember the user's Plasma Style id before we overwrite ``plasmarc``."""
+    if app.plasma_fallback_theme_id:
+        return app
+    cur = read_current_plasma_desktop_theme_id()
+    if cur and cur.casefold() != DESKTOP_THEME_ID.casefold():
+        app = AppSettings(
+            plasma_fallback_theme_id=cur,
+            plasma_panel_opacity_mode=app.plasma_panel_opacity_mode,
+            plasma_strong_panel_tint=app.plasma_strong_panel_tint,
+            plasma_component_colors=app.plasma_component_colors,
+        )
+        save_app_settings(app)
+    return app
+
+
+def resolve_fallback_desktop_theme(app: AppSettings | None = None) -> str:
+    """Plasma Style for ``FallbackTheme=`` — stored user theme, else adaptive default."""
+    app = app or load_app_settings()
+    stored = (app.plasma_fallback_theme_id or "").strip()
+    if stored and stored.casefold() != DESKTOP_THEME_ID.casefold():
+        if _desktop_theme_exists(stored):
+            return stored
+    cur = read_current_plasma_desktop_theme_id()
+    if cur and cur.casefold() not in (DESKTOP_THEME_ID.casefold(), ""):
+        if _desktop_theme_exists(cur):
+            return cur
+    # Prefer accent-adaptive themes (no bundled ``colors`` file).
+    for cand in ("default", "breeze-light", "breeze-dark", "breath-light", "breath", "breath-dark"):
+        if _desktop_theme_exists(cand) and not _theme_has_colors_file(cand):
+            return cand
+    for cand in ("default", "breeze-dark", "breeze-light", "breath-dark", "breath-light", "breath"):
+        if _desktop_theme_exists(cand):
+            return cand
+    return "default"
+
+
+def _desktop_theme_exists(theme_id: str) -> bool:
+    local = Path.home() / ".local/share/plasma/desktoptheme" / theme_id
+    if local.is_dir():
+        return True
+    return (Path("/usr/share/plasma/desktoptheme") / theme_id).is_dir()
+
+
+def _theme_has_colors_file(theme_id: str) -> bool:
+    for base in (
+        Path.home() / ".local/share/plasma/desktoptheme" / theme_id,
+        Path("/usr/share/plasma/desktoptheme") / theme_id,
+    ):
+        if (base / "colors").is_file():
+            return True
+    return False
+
+
 def plasma_desktop_theme_dir() -> Path:
     """``~/.local/share/plasma/desktoptheme/<DESKTOP_THEME_ID>/``."""
     return Path(os.path.expanduser(f"~/.local/share/plasma/desktoptheme/{DESKTOP_THEME_ID}"))
@@ -239,26 +456,17 @@ def read_current_plasma_desktop_theme_id() -> str | None:
 
 
 def default_fallback_desktop_theme() -> str:
-    """
-    Plasma Style to inherit SVG/widget assets from when only ``colors`` is custom.
-
-    Uses the user's *previous* shell theme from ``plasmarc`` when it is not our
-    generated theme; otherwise picks the first installed system theme from a
-    Manjaro-friendly list.
-    """
-    cur = read_current_plasma_desktop_theme_id()
-    if cur and cur.casefold() != DESKTOP_THEME_ID.casefold():
-        return cur
-    for cand in ("breath-dark", "breath-light", "breath", "default", "breeze-dark", "breeze-light"):
-        if (Path("/usr/share/plasma/desktoptheme") / cand).is_dir():
-            return cand
-    return "default"
+    """Backward-compatible wrapper — prefer :func:`resolve_fallback_desktop_theme`."""
+    return resolve_fallback_desktop_theme()
 
 
 def write_plasma_desktop_theme(
     pal: MaterialPalette,
     *,
     choices: SchemeApplyChoices | None = None,
+    adaptive_transparency_enabled: bool = False,
+    fallback_theme_id: str | None = None,
+    component_overrides: dict[str, ComponentColorOverride] | None = None,
 ) -> Path:
     """
     Install a Plasma **desktop theme** (Plasma Style) that reuses our palette.
@@ -270,8 +478,11 @@ def write_plasma_desktop_theme(
     """
     root = plasma_desktop_theme_dir()
     root.mkdir(parents=True, exist_ok=True)
-    fallback = default_fallback_desktop_theme()
-    (root / "colors").write_text(render_colors_file(pal, choices=choices), encoding="utf-8")
+    fallback = fallback_theme_id or resolve_fallback_desktop_theme()
+    (root / "colors").write_text(
+        render_colors_file(pal, choices=choices, component_overrides=component_overrides),
+        encoding="utf-8",
+    )
 
     meta = {
         "KPlugin": {
@@ -291,15 +502,15 @@ def write_plasma_desktop_theme(
     }
     (root / "metadata.json").write_text(json.dumps(meta, indent=4) + "\n", encoding="utf-8")
 
+    adaptive = "true" if adaptive_transparency_enabled else "false"
     theme_plasmarc = (
         f"[Settings]\nFallbackTheme={fallback}\n\n"
         "[ContrastEffect]\n"
-        "enabled=true\n"
+        "enabled=false\n"
         "contrast=0.2\n"
         "intensity=0.6\n"
         "saturation=10\n\n"
-        "[AdaptiveTransparency]\n"
-        "enabled=true\n"
+        f"[AdaptiveTransparency]\nenabled={adaptive}\n"
     )
     (root / "plasmarc").write_text(theme_plasmarc, encoding="utf-8")
     return root
@@ -380,6 +591,13 @@ def build_color_sections(
         rgb = _rgb_csv(c[ch.links])
         view["ForegroundLink"] = rgb
         view["ForegroundVisited"] = rgb
+    if ch.strong_panel_tint:
+        pc = c.get("primaryContainer", c["surfaceContainer"])
+        sch = c.get("surfaceContainerHigh", c["surfaceContainer"])
+        for sec_name in ("Colors:Window", "Colors:Complementary", "Colors:Header", "Colors:Header][Inactive"):
+            if sec_name in sections:
+                sections[sec_name]["BackgroundNormal"] = _rgb_csv(pc)
+                sections[sec_name]["BackgroundAlternate"] = _rgb_csv(sch)
     return sections
 
 
@@ -388,11 +606,15 @@ def render_colors_file(
     *,
     display_name: str | None = None,
     choices: SchemeApplyChoices | None = None,
+    component_overrides: dict[str, ComponentColorOverride] | None = None,
 ) -> str:
     """Build full `.colors` contents from Material palette."""
     name = display_name or "PlasmaColorizer"
     ch = normalize_scheme_apply_choices(choices)
     sections = build_color_sections(pal, ch)
+    sections = _apply_component_color_overrides(
+        sections, component_overrides, palette=pal,
+    )
     accent_hex = rgb_to_hex(pal.colors[ch.accent])
 
     parts: list[str] = []
@@ -544,10 +766,14 @@ def _set_general_kv(text: str, key: str, value: str) -> str:
 def apply_to_kdeglobals(
     pal: MaterialPalette,
     choices: SchemeApplyChoices | None = None,
+    component_overrides: dict[str, ComponentColorOverride] | None = None,
 ) -> Path:
     """Write Material palette sections + ``[General]`` keys into ``~/.config/kdeglobals``."""
     ch = normalize_scheme_apply_choices(choices)
     sections = build_color_sections(pal, ch)
+    sections = _apply_component_color_overrides(
+        sections, component_overrides, palette=pal,
+    )
 
     text = _read_kdeglobals_text()
     text = _set_general_color_scheme(text, SCHEME_FILE_STEM)
@@ -588,13 +814,17 @@ class DiskApplyResult:
 def apply_material_palette_to_disk(
     pal: MaterialPalette,
     choices: SchemeApplyChoices | None = None,
+    app_settings: AppSettings | None = None,
 ) -> DiskApplyResult:
     """Write ``.colors``, ``kdeglobals`` color sections, and install the desktop theme (best-effort)."""
+    app = app_settings or load_app_settings()
+    app = capture_plasma_fallback_theme(app)
     ch = normalize_scheme_apply_choices(choices)
-    body = render_colors_file(pal, choices=ch)
+    comp_overrides = overrides_from_settings_dict(app.plasma_component_colors)
+    body = render_colors_file(pal, choices=ch, component_overrides=comp_overrides)
     scheme_path = write_scheme_file(body)
     try:
-        kdg = apply_to_kdeglobals(pal, ch)
+        kdg = apply_to_kdeglobals(pal, ch, component_overrides=comp_overrides)
     except Exception as exc:  # noqa: BLE001
         return DiskApplyResult(
             scheme_path=scheme_path,
@@ -605,8 +835,19 @@ def apply_material_palette_to_disk(
     dpath: Path | None = None
     derr = ""
     try:
-        dpath = write_plasma_desktop_theme(pal, choices=ch)
+        mode = str_to_panel_opacity_mode(app.plasma_panel_opacity_mode)
+        adaptive = mode == PanelOpacityMode.TRANSLUCENT
+        fallback = resolve_fallback_desktop_theme(app)
+        dpath = write_plasma_desktop_theme(
+            pal,
+            choices=ch,
+            adaptive_transparency_enabled=adaptive,
+            fallback_theme_id=fallback,
+            component_overrides=comp_overrides,
+        )
         merge_user_plasmarc_select_desktop_theme()
+        apply_plasma_panel_opacity_mode(mode)
+        _sync_kdedefaults_color_scheme(SCHEME_FILE_STEM)
     except Exception as exc:  # noqa: BLE001
         derr = str(exc)
     return DiskApplyResult(
@@ -617,6 +858,115 @@ def apply_material_palette_to_disk(
         desktop_theme_path=dpath,
         desktop_theme_error=derr,
     )
+
+
+def _sync_kdedefaults_color_scheme(scheme_name: str) -> None:
+    """Best-effort: align ``kdedefaults`` ``ColorScheme`` for next login."""
+    path = kdedefaults_path()
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    new_text = _set_general_color_scheme(text, scheme_name)
+    if new_text != text:
+        tmp = path.with_suffix(path.suffix + ".plasmacolorizer.tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def apply_plasma_desktop_theme_live(
+    theme_id: str = DESKTOP_THEME_ID,
+    *,
+    timeout_s: float = 8.0,
+) -> tuple[bool, str]:
+    """Run ``plasma-apply-desktoptheme`` so plasmashell reloads shell widget colours."""
+    exe = shutil.which("plasma-apply-desktoptheme")
+    if not exe:
+        return False, "plasma-apply-desktoptheme not found in PATH"
+    try:
+        proc = subprocess.run(
+            [exe, theme_id],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"plasma-apply-desktoptheme timed out after {timeout_s:.0f}s"
+    except OSError as exc:
+        return False, f"plasma-apply-desktoptheme: {exc}"
+    if proc.returncode == 0:
+        return True, "plasma-apply-desktoptheme OK"
+    err = (proc.stderr or proc.stdout or "").strip()
+    tail = f": {err[:200]}" if err else ""
+    return False, f"plasma-apply-desktoptheme returned {proc.returncode}{tail}"
+
+
+def toggle_reload_plasma_desktop_theme(
+    *,
+    theme_id: str = DESKTOP_THEME_ID,
+    fallback_id: str | None = None,
+) -> tuple[bool, str]:
+    """Briefly switch Plasma Style away and back to force a theme cache flush."""
+    fb = fallback_id or resolve_fallback_desktop_theme()
+    try:
+        merge_user_plasmarc_select_desktop_theme(fb)
+        merge_user_plasmarc_select_desktop_theme(theme_id)
+    except OSError as exc:
+        return False, f"Plasma Style toggle failed: {exc}"
+    return True, f"Plasma Style toggled {fb!r} → {theme_id!r}"
+
+
+def collect_apply_diagnostics(app_settings: AppSettings | None = None) -> list[str]:
+    """Return human-readable warnings about conditions that hide scheme colours."""
+    app = app_settings or load_app_settings()
+    warnings: list[str] = []
+    cur = read_current_plasma_desktop_theme_id()
+    if cur and cur.casefold() != DESKTOP_THEME_ID.casefold():
+        warnings.append(
+            f"Plasma Style in plasmarc is {cur!r} (expected {DESKTOP_THEME_ID!r}). "
+            "Re-apply or pick PlasmaColorizer in System Settings → Appearance → Plasma Style."
+        )
+    mode = read_plasma_panel_opacity_mode()
+    if mode == PanelOpacityMode.TRANSLUCENT:
+        warnings.append(
+            "Panel opacity mode is Translucent — custom colours may look faint through the wallpaper. "
+            "Switch to Solid in PlasmaColorizer or panel settings for stronger tints."
+        )
+    elif mode == PanelOpacityMode.ADAPTIVE:
+        warnings.append(
+            "Panel opacity mode is Adaptive — the taskbar is translucent when no window touches it."
+        )
+    ui_mode = str_to_panel_opacity_mode(app.plasma_panel_opacity_mode)
+    if ui_mode == PanelOpacityMode.TRANSLUCENT:
+        warnings.append(
+            "Panel opacity is set to Translucent — scheme tints may be hard to see on the taskbar."
+        )
+    try:
+        applets = plasma_appletsrc_path().read_text(encoding="utf-8", errors="replace")
+        if "luisbocanegra.kdematerialyou.colors" in applets:
+            warnings.append(
+                "Panel contains luisbocanegra.kdematerialyou.colors — it may override "
+                "PlasmaColorizer accent colours independently."
+            )
+    except OSError:
+        pass
+    if kde_material_you_colors_config().is_file():
+        warnings.append(
+            "kde-material-you-colors is configured — it may compete with PlasmaColorizer accents."
+        )
+    try:
+        kd_text = kdedefaults_path().read_text(encoding="utf-8", errors="replace")
+        if "ColorScheme=PlasmaColorizer" not in kd_text and "colorscheme=plasmacolorizer" not in kd_text.lower():
+            if "ColorScheme=" in kd_text:
+                warnings.append(
+                    "kdedefaults still references a different ColorScheme — "
+                    "login may briefly restore the old scheme before PlasmaColorizer applies."
+                )
+    except OSError:
+        pass
+    return warnings
 
 
 def notify_kde_palette_change(
@@ -643,12 +993,23 @@ def notify_kde_palette_change(
     ch = normalize_scheme_apply_choices(choices)
     parts: list[str] = []
     ok_any = False
+
+    live_ok, live_msg = apply_plasma_desktop_theme_live()
+    parts.append(live_msg)
+    if live_ok:
+        ok_any = True
+    else:
+        tr_ok, tr_msg = toggle_reload_plasma_desktop_theme()
+        parts.append(tr_msg)
+        ok_any = ok_any or tr_ok
+
     try:
         import dbus  # type: ignore
 
         bus = dbus.SessionBus()
     except Exception as exc:  # noqa: BLE001
-        return False, f"DBus session bus unavailable: {exc}"
+        parts.append(f"DBus session bus unavailable: {exc}")
+        return ok_any, "; ".join(parts)
 
     try:
         kwin = bus.get_object("org.kde.KWin", "/KWin")
