@@ -41,6 +41,9 @@ class WorkerResult:
     apply_ok: bool
     apply_error: str = ""
     choices: SchemeApplyChoices | None = None
+    konsole_error: str = ""
+    dolphin_error: str = ""
+    dolphin_note: str = ""
 
 
 def compute_material_palette_from_wallpaper(
@@ -180,6 +183,12 @@ class ApplyPaletteWorker(QObject):
                     f"Desktop theme / plasmarc step failed (Qt apps still updated): "
                     f"{disk.desktop_theme_error}"
                 )
+            if disk.konsole_error:
+                self._emit(f"Konsole theming: {disk.konsole_error}")
+            if disk.dolphin_error:
+                self._emit(f"Dolphin theming: {disk.dolphin_error}")
+            elif disk.dolphin_note:
+                self._emit(f"Dolphin: {disk.dolphin_note}")
             self._emit("Apply finished.")
             self.finished.emit(WorkerResult(
                 src=self._src,
@@ -189,6 +198,9 @@ class ApplyPaletteWorker(QObject):
                 apply_ok=True,
                 apply_error="",
                 choices=self._choices,
+                konsole_error=disk.konsole_error,
+                dolphin_error=disk.dolphin_error,
+                dolphin_note=disk.dolphin_note,
             ))
         except Exception as exc:  # noqa: BLE001
             log.exception("ApplyPaletteWorker raised")
@@ -280,6 +292,12 @@ class GenerateSchemeWorker(QObject):
                     f"Desktop theme / plasmarc step failed (Qt apps still updated): "
                     f"{disk.desktop_theme_error}"
                 )
+            if disk.konsole_error:
+                self._emit(f"Konsole theming: {disk.konsole_error}")
+            if disk.dolphin_error:
+                self._emit(f"Dolphin theming: {disk.dolphin_error}")
+            elif disk.dolphin_note:
+                self._emit(f"Dolphin: {disk.dolphin_note}")
             self._emit("Worker finished")
             self.finished.emit(WorkerResult(
                 src=self._src_path,
@@ -289,6 +307,9 @@ class GenerateSchemeWorker(QObject):
                 apply_ok=True,
                 apply_error="",
                 choices=self._choices,
+                konsole_error=disk.konsole_error,
+                dolphin_error=disk.dolphin_error,
+                dolphin_note=disk.dolphin_note,
             ))
 
         except Exception as exc:  # noqa: BLE001

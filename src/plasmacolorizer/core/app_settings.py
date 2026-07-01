@@ -21,6 +21,24 @@ class AppSettings:
     plasma_strong_panel_tint: bool = False
     # Optional per-component KDE color overrides (component_id → override dict).
     plasma_component_colors: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Write PlasmaColorizer.colorscheme and patch the default Konsole profile on apply.
+    apply_konsole_scheme: bool = True
+    # Set dolphinrc ColorScheme=* so Dolphin follows the global Plasma scheme.
+    dolphin_follow_system_colorscheme: bool = True
+    # Re-run generate+apply when the Plasma wallpaper changes (while app is open).
+    auto_apply_on_wallpaper_change: bool = True
+    # Background login daemon that watches wallpaper even when the UI is closed.
+    wallpaper_daemon_enabled: bool = True
+    wallpaper_daemon_poll_interval_s: float = 3.0
+    wallpaper_monitor: int = 0
+    # Persisted Colorizer tab generation options (used by daemon + next UI session).
+    quantizer_quality: int = 4
+    primary_bias_strength: float = 0.0
+    dark_mode: str = "follow"  # follow | dark | light
+    scheme_accent: str = "primary"
+    scheme_emphasis: str = "secondary"
+    scheme_links: str = ""
+    restart_plasma_after_apply: bool = True
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -43,6 +61,33 @@ class AppSettings:
                 data.get("plasma_strong_panel_tint"), default=False,
             ),
             plasma_component_colors=comp,
+            apply_konsole_scheme=_opt_bool(data.get("apply_konsole_scheme"), default=True),
+            dolphin_follow_system_colorscheme=_opt_bool(
+                data.get("dolphin_follow_system_colorscheme"), default=True,
+            ),
+            auto_apply_on_wallpaper_change=_opt_bool(
+                data.get("auto_apply_on_wallpaper_change"), default=True,
+            ),
+            wallpaper_daemon_enabled=_opt_bool(
+                data.get("wallpaper_daemon_enabled"), default=True,
+            ),
+            wallpaper_daemon_poll_interval_s=_opt_positive_float(
+                data.get("wallpaper_daemon_poll_interval_s"), default=3.0,
+            ),
+            wallpaper_monitor=_opt_int_range(data.get("wallpaper_monitor"), default=0, minimum=0),
+            quantizer_quality=_opt_int_range(
+                data.get("quantizer_quality"), default=4, minimum=1, maximum=10,
+            ),
+            primary_bias_strength=_opt_float_range(
+                data.get("primary_bias_strength"), default=0.0,
+            ),
+            dark_mode=_opt_str(data.get("dark_mode"), default="follow"),
+            scheme_accent=_opt_str(data.get("scheme_accent"), default="primary"),
+            scheme_emphasis=_opt_str(data.get("scheme_emphasis"), default="secondary"),
+            scheme_links=_opt_str(data.get("scheme_links"), default=""),
+            restart_plasma_after_apply=_opt_bool(
+                data.get("restart_plasma_after_apply"), default=True,
+            ),
         )
 
 
@@ -82,6 +127,36 @@ def _opt_float_range(v: Any, *, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, x))
+
+
+def _opt_positive_float(v: Any, *, default: float) -> float:
+    if v is None or v == "":
+        return default
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(1.0, x)
+
+
+def _opt_int_range(v: Any, *, default: int, minimum: int, maximum: int | None = None) -> int:
+    if v is None or v == "":
+        return default
+    try:
+        x = int(v)
+    except (TypeError, ValueError):
+        return default
+    if maximum is not None:
+        return max(minimum, min(maximum, x))
+    return max(minimum, x)
+
+
+def _opt_str(v: Any, *, default: str) -> str:
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip() or default
+    return str(v)
 
 
 def _read_settings_json() -> dict[str, Any]:

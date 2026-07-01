@@ -1,11 +1,11 @@
-"""Primary window with Colorizer and Conky tabs."""
+"""Primary window with Colorizer, Conky, and Log tabs."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread, QTimer
-from PyQt6.QtGui import QColor, QCloseEvent
+from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread, QTimer, QUrl
+from PyQt6.QtGui import QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -44,6 +44,14 @@ from plasmacolorizer.conky.templating import render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
 from plasmacolorizer.core.app_settings import AppSettings, load_app_settings, save_app_settings
+from plasmacolorizer.core.wallpaper_watch import (
+    WALLPAPER_CHANGE_DEBOUNCE_MS,
+    WALLPAPER_POLL_INTERVAL_MS,
+    wallpaper_fingerprint,
+    wallpaper_fingerprint_for_path,
+    wallpaper_watch_skipped,
+)
+from plasmacolorizer import wallpaper_daemon
 from plasmacolorizer.core.component_colors import (
     COMPONENT_BY_ID,
     PLASMA_COMPONENTS,
@@ -75,7 +83,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PlasmaColorizer")
-        self.resize(QSize(900, 640))
+        self.resize(QSize(900, 520))
 
         self._log_file = log_file_path()
         self._logger = get_logger()
@@ -88,17 +96,52 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: QObject | None = None
         self._busy: QProgressDialog | None = None
+        self._last_wallpaper_fingerprint: str | None = None
+        self._pending_wallpaper_path: str | None = None
+        self._suppress_apply_dialogs = False
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_color_tab(), "Colorizer")
-        tabs.addTab(self._build_conky_tab(), "Conky")
+        log_tab = self._build_log_tab()
+        color_tab = self._build_color_tab()
+        conky_tab = self._build_conky_tab()
+        tabs.addTab(color_tab, "Colorizer")
+        tabs.addTab(conky_tab, "Conky")
+        tabs.addTab(log_tab, "Log")
         self.setCentralWidget(tabs)
+
+        self._append_log(
+            "Ready.\n"
+            "  - Autodetect + preview runs once when the window opens (Plasma wallpaper for the screen index).\n"
+            "  - Detect / Override / Preview palette: change the image any time (no disk writes until you apply).\n"
+            "  - Click swatches to pick colors (KDE’s dialog often includes a screen dropper).\n"
+            "  - Adjust accent / emphasis / links, then Apply — or Generate and apply in one step.\n"
+            f"  - A detailed log is written to {self._log_file}"
+        )
+        if plasma_scheme.theme_plasmarc_has_breaking_sections():
+            self._append_log(
+                "WARN: PlasmaColorizer theme plasmarc contains opacity-breaking sections — "
+                "panel Solid / Adaptive / Translucent may all look the same. "
+                "Use Repair theme for panel opacity on the Colorizer tab."
+            )
+        self._update_panel_opacity_repair_btn()
+
+        self._wallpaper_debounce_timer = QTimer(self)
+        self._wallpaper_debounce_timer.setSingleShot(True)
+        self._wallpaper_debounce_timer.setInterval(WALLPAPER_CHANGE_DEBOUNCE_MS)
+        self._wallpaper_debounce_timer.timeout.connect(self._on_wallpaper_change_debounced)
+
+        self._wallpaper_poll_timer = QTimer(self)
+        self._wallpaper_poll_timer.setInterval(WALLPAPER_POLL_INTERVAL_MS)
+        self._wallpaper_poll_timer.timeout.connect(self._on_wallpaper_poll_tick)
+        self._sync_wallpaper_watchers()
+        self._update_daemon_status_label()
+
         QTimer.singleShot(0, self._startup_autodetect_preview)
 
     # --- Colorizer tab -------------------------------------------------
     def _build_color_tab(self) -> QWidget:
-        outer = QWidget()
-        layout = QVBoxLayout(outer)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(14)
 
         box = QGroupBox("Wallpaper and extraction")
@@ -122,6 +165,7 @@ class MainWindow(QMainWindow):
         self._monitor = QSpinBox()
         self._monitor.setRange(0, 16)
         self._monitor.setValue(0)
+        self._monitor.valueChanged.connect(self._save_app_settings_from_ui)
 
         self._quality = QSpinBox()
         self._quality.setRange(1, 10)
@@ -302,7 +346,8 @@ class MainWindow(QMainWindow):
             self._plasma_panel_opacity_combo.addItem(label, mode)
         self._plasma_panel_opacity_combo.setToolTip(
             "Plasma 6 panel opacity mode (not partial alpha like Conky). "
-            "Solid keeps scheme colours visible on the taskbar."
+            "Solid keeps scheme colours visible on the taskbar. "
+            "Changing this restarts plasmashell briefly so the panel picks up the new mode."
         )
         self._plasma_panel_opacity_combo.currentIndexChanged.connect(
             self._on_plasma_panel_opacity_mode_changed,
@@ -310,15 +355,85 @@ class MainWindow(QMainWindow):
         opacity_form = QFormLayout()
         opacity_form.addRow("Panel opacity", self._plasma_panel_opacity_combo)
         scheme_layout.addLayout(opacity_form)
+
+        opacity_diag_row = QHBoxLayout()
+        self._panel_opacity_diagnose_btn = QPushButton("Diagnose panel opacity")
+        self._panel_opacity_diagnose_btn.setObjectName("secondary")
+        self._panel_opacity_diagnose_btn.setToolTip(
+            "Run checks on plasmashellrc, live panel state, Plasma Style plasmarc, "
+            "competing tools, and KWin blur."
+        )
+        self._panel_opacity_diagnose_btn.clicked.connect(self._on_diagnose_panel_opacity)
+        self._panel_opacity_repair_btn = QPushButton("Repair theme for panel opacity")
+        self._panel_opacity_repair_btn.setObjectName("secondary")
+        self._panel_opacity_repair_btn.setToolTip(
+            "Remove opacity-breaking sections from the PlasmaColorizer theme plasmarc "
+            "and restart plasmashell."
+        )
+        self._panel_opacity_repair_btn.clicked.connect(self._on_repair_panel_opacity)
+        opacity_diag_row.addWidget(self._panel_opacity_diagnose_btn)
+        opacity_diag_row.addWidget(self._panel_opacity_repair_btn)
+        opacity_diag_row.addStretch(1)
+        scheme_layout.addLayout(opacity_diag_row)
+
         plasma_opacity_hint = QLabel(
-            "Plasma 6 supports three panel modes (Solid / Adaptive / Translucent), not a continuous "
-            "transparency slider."
+            "Plasma 6 uses three discrete panel modes (Solid / Adaptive / Translucent), not a "
+            "continuous transparency slider like Conky. Translucent shows the wallpaper through "
+            "the panel; KWin blur and wallpaper contrast make the effect easier to see. "
+            "If all three modes look identical, the PlasmaColorizer theme plasmarc may need repair — "
+            "use Diagnose, then Repair. Changing the mode restarts plasmashell briefly."
         )
         plasma_opacity_hint.setWordWrap(True)
         scheme_layout.addWidget(plasma_opacity_hint)
 
         scheme_box.setLayout(scheme_layout)
         layout.addWidget(scheme_box)
+
+        self._apply_konsole_scheme = QCheckBox("Apply palette to Konsole (default profile)")
+        self._apply_konsole_scheme.setChecked(True)
+        self._apply_konsole_scheme.setToolTip(
+            "Writes ~/.local/share/konsole/PlasmaColorizer.colorscheme and updates the "
+            "default profile from konsolerc when you apply a palette."
+        )
+        self._apply_konsole_scheme.toggled.connect(self._save_app_settings_from_ui)
+        layout.addWidget(self._apply_konsole_scheme)
+
+        self._dolphin_follow_system = QCheckBox("Point Dolphin at system color scheme")
+        self._dolphin_follow_system.setChecked(True)
+        self._dolphin_follow_system.setToolTip(
+            "Sets ~/.config/dolphinrc [UiSettings] ColorScheme=* so Dolphin follows the "
+            "global Plasma scheme instead of a per-app pin (e.g. MaterialYouDark)."
+        )
+        self._dolphin_follow_system.toggled.connect(self._save_app_settings_from_ui)
+        layout.addWidget(self._dolphin_follow_system)
+
+        self._auto_apply_wallpaper = QCheckBox("Automatically re-apply when wallpaper changes")
+        self._auto_apply_wallpaper.setChecked(True)
+        self._auto_apply_wallpaper.setToolTip(
+            "While PlasmaColorizer is open, poll the Plasma wallpaper every 30s and run "
+            "Generate and apply when it changes (skipped when Override is set)."
+        )
+        self._auto_apply_wallpaper.toggled.connect(self._save_app_settings_from_ui)
+        layout.addWidget(self._auto_apply_wallpaper)
+
+        self._wallpaper_daemon = QCheckBox("Run wallpaper watcher at login (background daemon)")
+        self._wallpaper_daemon.setChecked(True)
+        self._wallpaper_daemon.setToolTip(
+            "Installs ~/.config/autostart/plasmacolorizer-daemon.desktop and polls the "
+            "Plasma wallpaper every few seconds — even when this window is closed."
+        )
+        self._wallpaper_daemon.toggled.connect(self._on_wallpaper_daemon_toggled)
+        layout.addWidget(self._wallpaper_daemon)
+
+        daemon_row = QHBoxLayout()
+        self._daemon_status = QLabel()
+        self._daemon_status.setWordWrap(True)
+        restart_daemon = QPushButton("Restart watcher")
+        restart_daemon.setObjectName("secondary")
+        restart_daemon.clicked.connect(self._on_restart_wallpaper_daemon)
+        daemon_row.addWidget(self._daemon_status, 1)
+        daemon_row.addWidget(restart_daemon)
+        layout.addLayout(daemon_row)
 
         step_hint = QLabel(
             "On launch the app <b>autodetects</b> the Plasma wallpaper for the chosen screen and "
@@ -377,27 +492,80 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self._restart_plasma)
 
-        log_box = QGroupBox("Log")
-        log_layout = QVBoxLayout()
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setMinimumHeight(200)
-        log_layout.addWidget(self._log)
-        log_box.setLayout(log_layout)
-        layout.addWidget(log_box)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(content)
+        wrap = QWidget()
+        wrap_layout = QVBoxLayout(wrap)
+        wrap_layout.setContentsMargins(0, 0, 0, 0)
+        wrap_layout.addWidget(scroll)
 
-        self._append_log(
-            "Ready.\n"
-            "  - Autodetect + preview runs once when the window opens (Plasma wallpaper for the screen index).\n"
-            "  - Detect / Override / Preview palette: change the image any time (no disk writes until you apply).\n"
-            "  - Click swatches to pick colors (KDE’s dialog often includes a screen dropper).\n"
-            "  - Adjust accent / emphasis / links, then Apply — or Generate and apply in one step.\n"
-            f"  - A detailed log is written to {self._log_file}"
-        )
         self._clear_swatches()
         self._load_app_settings_to_ui()
         self._update_component_color_swatches()
-        return outer
+        return wrap
+
+    def _build_log_tab(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        hint = QLabel(
+            f"Session log (also written to <code>{self._log_file}</code>). "
+            "Open this tab during long apply runs."
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(hint)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMinimumHeight(300)
+        layout.addWidget(self._log, 1)
+        open_btn = QPushButton("Open log file")
+        open_btn.setObjectName("secondary")
+        open_btn.clicked.connect(self._on_open_log_file)
+        layout.addWidget(open_btn)
+        return wrap
+
+    def _on_open_log_file(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._log_file)))
+
+    def _update_panel_opacity_repair_btn(self) -> None:
+        if hasattr(self, "_panel_opacity_repair_btn"):
+            self._panel_opacity_repair_btn.setEnabled(plasma_scheme.theme_plasmarc_needs_repair())
+
+    def _on_diagnose_panel_opacity(self) -> None:
+        diagnostics = plasma_scheme.run_panel_opacity_diagnostics(self._app_settings_from_ui())
+        self._append_log("Panel opacity diagnostics:")
+        for line in plasma_scheme.format_panel_opacity_diagnostics(diagnostics):
+            self._append_log(f"  {line}")
+        self._update_panel_opacity_repair_btn()
+        failures = [
+            d for d in diagnostics
+            if d.severity == plasma_scheme.DiagnosticSeverity.FAIL
+        ]
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Panel opacity issue detected",
+                "Diagnostics found problems that can block visible panel opacity modes:\n\n- "
+                + "\n\n- ".join(d.message for d in failures)
+                + "\n\nUse Repair theme for panel opacity if needed, then re-test Solid vs Translucent.",
+            )
+
+    def _on_repair_panel_opacity(self) -> None:
+        self._append_log("Repairing PlasmaColorizer theme for panel opacity…")
+        try:
+            ok, msg = plasma_scheme.repair_plasma_theme_for_panel_opacity()
+            self._append_log(msg)
+            if not ok:
+                self._append_log(
+                    "Repair completed with errors — check the log and try "
+                    "kquitapp6 plasmashell && kstart plasmashell manually.",
+                )
+        except OSError as exc:
+            self._append_log(f"Repair failed: {exc}")
+            return
+        self._on_diagnose_panel_opacity()
 
     def _plasma_panel_opacity_mode_from_ui(self) -> str:
         mode = self._plasma_panel_opacity_combo.currentData()
@@ -415,17 +583,34 @@ class MainWindow(QMainWindow):
     def _on_plasma_panel_opacity_mode_changed(self, _index: int) -> None:
         self._save_app_settings_from_ui()
         mode = str_to_panel_opacity_mode(self._plasma_panel_opacity_mode_from_ui())
+        self._append_log(
+            f"Applying panel opacity → {plasma_scheme.panel_opacity_mode_to_str(mode)} "
+            f"({int(mode)})…",
+        )
         try:
-            plasma_scheme.apply_plasma_panel_opacity_mode(mode)
-            ok, msg = plasma_scheme.reload_plasma_panel_config()
-            self._append_log(
-                f"Panel opacity → {plasma_scheme.panel_opacity_mode_to_str(mode)} "
-                f"({int(mode)}); {msg}",
-            )
+            ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(mode)
+            self._append_log(msg)
             if not ok:
-                self._append_log("Note: panel may need a plasmashell restart to update visually.")
+                self._append_log(
+                    "Panel opacity was saved to plasmashellrc but plasmashell could not restart. "
+                    "Run manually: kquitapp6 plasmashell && kstart plasmashell",
+                )
         except OSError as exc:
-            self._append_log(f"Panel opacity write failed: {exc}")
+            self._append_log(f"Panel opacity apply failed: {exc}")
+
+        overriders = plasma_scheme.detect_competing_panel_tools()
+        if overriders:
+            for note in overriders:
+                self._append_log(f"Note: {note}")
+            QMessageBox.warning(
+                self,
+                "Panel opacity may be overridden",
+                "PlasmaColorizer applied the panel opacity mode, but another tool is painting "
+                "your panel background, so the change may not be visible:\n\n- "
+                + "\n\n- ".join(overriders)
+                + "\n\nDisable or pause that tool, then try the opacity mode again.",
+            )
+        self._update_panel_opacity_repair_btn()
 
     def _load_app_settings_to_ui(self) -> None:
         app = load_app_settings()
@@ -438,6 +623,44 @@ class MainWindow(QMainWindow):
         self._component_overrides = overrides_from_settings_dict(app.plasma_component_colors)
         if self._component_overrides:
             self._component_colors_toggle.setChecked(True)
+        self._apply_konsole_scheme.setChecked(app.apply_konsole_scheme)
+        self._dolphin_follow_system.setChecked(app.dolphin_follow_system_colorscheme)
+        self._auto_apply_wallpaper.setChecked(app.auto_apply_on_wallpaper_change)
+        self._wallpaper_daemon.setChecked(app.wallpaper_daemon_enabled)
+        self._monitor.setValue(app.wallpaper_monitor)
+        self._quality.setValue(app.quantizer_quality)
+        self._primary_bias_slider.setValue(int(round(app.primary_bias_strength * 100)))
+        self._set_dark_mode_combo(app.dark_mode)
+        self._set_combo_data(self._accent_combo, app.scheme_accent)
+        self._set_combo_data(self._emphasis_combo, app.scheme_emphasis)
+        if app.scheme_links:
+            self._set_combo_data(self._links_combo, app.scheme_links)
+        else:
+            self._links_combo.setCurrentIndex(0)
+        self._restart_plasma.setChecked(app.restart_plasma_after_apply)
+
+    def _set_dark_mode_combo(self, mode: str) -> None:
+        key = (mode or "follow").strip().lower()
+        idx = {"follow": 0, "dark": 1, "light": 2}.get(key, 0)
+        self._dark_combo.setCurrentIndex(idx)
+
+    def _dark_mode_from_ui(self) -> str:
+        idx = self._dark_combo.currentIndex()
+        if idx == 1:
+            return "dark"
+        if idx == 2:
+            return "light"
+        return "follow"
+
+    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return
+
+    def _scheme_links_from_ui(self) -> str:
+        data = self._links_combo.currentData()
+        return data if isinstance(data, str) else ""
 
     def _app_settings_from_ui(self) -> AppSettings:
         prev = load_app_settings()
@@ -446,10 +669,83 @@ class MainWindow(QMainWindow):
             plasma_panel_opacity_mode=self._plasma_panel_opacity_mode_from_ui(),
             plasma_strong_panel_tint=self._plasma_strong_panel_tint.isChecked(),
             plasma_component_colors=overrides_to_settings_dict(self._component_overrides),
+            apply_konsole_scheme=self._apply_konsole_scheme.isChecked(),
+            dolphin_follow_system_colorscheme=self._dolphin_follow_system.isChecked(),
+            auto_apply_on_wallpaper_change=self._auto_apply_wallpaper.isChecked(),
+            wallpaper_daemon_enabled=self._wallpaper_daemon.isChecked(),
+            wallpaper_daemon_poll_interval_s=prev.wallpaper_daemon_poll_interval_s,
+            wallpaper_monitor=self._monitor.value(),
+            quantizer_quality=self._quality.value(),
+            primary_bias_strength=self._primary_bias_slider.value() / 100.0,
+            dark_mode=self._dark_mode_from_ui(),
+            scheme_accent=str(self._accent_combo.currentData() or "primary"),
+            scheme_emphasis=str(self._emphasis_combo.currentData() or "secondary"),
+            scheme_links=self._scheme_links_from_ui(),
+            restart_plasma_after_apply=self._restart_plasma.isChecked(),
         )
 
     def _save_app_settings_from_ui(self) -> None:
         save_app_settings(self._app_settings_from_ui())
+
+    def _sync_wallpaper_watchers(self) -> None:
+        app = load_app_settings()
+        if app.wallpaper_daemon_enabled and app.auto_apply_on_wallpaper_change:
+            self._wallpaper_poll_timer.stop()
+            self._ensure_wallpaper_daemon_running()
+        elif app.auto_apply_on_wallpaper_change:
+            if not self._wallpaper_poll_timer.isActive():
+                self._wallpaper_poll_timer.start()
+        else:
+            self._wallpaper_poll_timer.stop()
+
+    def _ensure_wallpaper_daemon_running(self) -> None:
+        if not self._wallpaper_daemon.isChecked():
+            return
+        wallpaper_daemon.install_autostart()
+        if wallpaper_daemon.is_daemon_running():
+            return
+        import subprocess
+        import sys
+
+        subprocess.Popen(
+            [sys.executable, "-m", "plasmacolorizer.wallpaper_daemon"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _update_daemon_status_label(self) -> None:
+        if self._wallpaper_daemon.isChecked():
+            running = wallpaper_daemon.is_daemon_running()
+            autostart = wallpaper_daemon.autostart_installed()
+            parts = [
+                "Watcher: running" if running else "Watcher: not running",
+                "autostart on" if autostart else "autostart off",
+            ]
+            self._daemon_status.setText(" · ".join(parts))
+        else:
+            self._daemon_status.setText("Background watcher disabled — in-app polling only when open.")
+
+    def _on_wallpaper_daemon_toggled(self, enabled: bool) -> None:
+        self._save_app_settings_from_ui()
+        if enabled:
+            wallpaper_daemon.install_autostart()
+            self._ensure_wallpaper_daemon_running()
+            self._wallpaper_poll_timer.stop()
+        else:
+            wallpaper_daemon.stop_daemon()
+            wallpaper_daemon.uninstall_autostart()
+            if self._auto_apply_wallpaper.isChecked():
+                self._wallpaper_poll_timer.start()
+        self._update_daemon_status_label()
+
+    def _on_restart_wallpaper_daemon(self) -> None:
+        self._save_app_settings_from_ui()
+        wallpaper_daemon.stop_daemon()
+        if self._wallpaper_daemon.isChecked():
+            self._ensure_wallpaper_daemon_running()
+        self._update_daemon_status_label()
+        self._append_log("Wallpaper watcher restarted.")
 
     def _dark_choice(self) -> bool | None:
         idx = self._dark_combo.currentIndex()
@@ -683,6 +979,7 @@ class MainWindow(QMainWindow):
             path = wp.current_wallpaper_image_path(self._monitor.value())
             self._path_display.setText(path)
             self._last_wallpaper_src = path
+            self._last_wallpaper_fingerprint = wallpaper_fingerprint_for_path(path)
             self._append_log(f"Detected wallpaper file: {path}")
             self._append_log("Next: Preview palette (recommended) or Generate and apply in one step.")
         except Exception as exc:  # noqa: BLE001
@@ -697,7 +994,50 @@ class MainWindow(QMainWindow):
             return
         self._path_display.setText(src)
         self._append_log(f"Startup: autodetected wallpaper ({src}).")
+        self._last_wallpaper_fingerprint = wallpaper_fingerprint_for_path(src)
         self._start_preview_palette(src)
+
+    def _on_wallpaper_poll_tick(self) -> None:
+        if wallpaper_watch_skipped(self._manual_path.text()):
+            return
+        if self._thread is not None and self._thread.isRunning():
+            return
+        fp = wallpaper_fingerprint(self._monitor.value())
+        if fp is None:
+            return
+        if self._last_wallpaper_fingerprint is None:
+            self._last_wallpaper_fingerprint = fp
+            return
+        if fp == self._last_wallpaper_fingerprint:
+            return
+        try:
+            path = wp.current_wallpaper_image_path(self._monitor.value())
+        except (FileNotFoundError, OSError):
+            return
+        self._pending_wallpaper_path = path
+        self._wallpaper_debounce_timer.start()
+
+    def _on_wallpaper_change_debounced(self) -> None:
+        path = self._pending_wallpaper_path
+        self._pending_wallpaper_path = None
+        if not path:
+            return
+        fp = wallpaper_fingerprint_for_path(path)
+        if fp == self._last_wallpaper_fingerprint:
+            return
+        self._last_wallpaper_fingerprint = fp
+        self._path_display.setText(path)
+        self._last_wallpaper_src = path
+        self._append_log(f"[auto] Wallpaper changed: {path}")
+        if not self._auto_apply_wallpaper.isChecked():
+            self._append_log("[auto] Auto-apply disabled — use Generate and apply manually.")
+            return
+        if self._thread is not None and self._thread.isRunning():
+            self._append_log("[auto] Worker busy — will not queue another apply.")
+            return
+        self._append_log("[auto] Re-applying palette for new wallpaper…")
+        self._suppress_apply_dialogs = True
+        self._on_generate()
 
     def _start_preview_palette(self, src: str) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -894,15 +1234,24 @@ class MainWindow(QMainWindow):
 
         if not result.apply_ok:
             self._append_log(f"Apply error: {result.apply_error}")
-            QMessageBox.warning(
-                self,
-                "PlasmaColorizer",
-                f"Scheme file was written to:\n{result.scheme_path}\n\n"
-                f"But colors could not be written to ~/.config/kdeglobals:\n{result.apply_error}\n\n"
-                "Open System Settings -> Appearance -> Colors and pick "
-                f"\"{plasma_scheme.SCHEME_FILE_STEM}\" manually.",
-            )
+            if not self._suppress_apply_dialogs:
+                QMessageBox.warning(
+                    self,
+                    "PlasmaColorizer",
+                    f"Scheme file was written to:\n{result.scheme_path}\n\n"
+                    f"But colors could not be written to ~/.config/kdeglobals:\n{result.apply_error}\n\n"
+                    "Open System Settings -> Appearance -> Colors and pick "
+                    f"\"{plasma_scheme.SCHEME_FILE_STEM}\" manually.",
+                )
+            self._suppress_apply_dialogs = False
             return
+
+        if result.konsole_error:
+            self._append_log(f"Konsole theming: {result.konsole_error}")
+        if result.dolphin_error:
+            self._append_log(f"Dolphin theming: {result.dolphin_error}")
+        elif getattr(result, "dolphin_note", ""):
+            self._append_log(f"Dolphin: {result.dolphin_note}")
 
         # kdeglobals write succeeded; push palette to KWin, shell, and global accent (main thread).
         app = self._app_settings_from_ui()
@@ -922,6 +1271,21 @@ class MainWindow(QMainWindow):
             rs_ok, rs_msg = plasma_scheme.restart_plasmashell()
             self._append_log(rs_msg)
             restarted = rs_ok
+
+        self._save_app_settings_from_ui()
+        try:
+            self._last_wallpaper_fingerprint = wallpaper_fingerprint_for_path(str(result.src))
+        except OSError:
+            pass
+        self._ensure_wallpaper_daemon_running()
+        self._sync_wallpaper_watchers()
+        self._update_daemon_status_label()
+
+        if self._suppress_apply_dialogs:
+            self._suppress_apply_dialogs = False
+            if notify_ok:
+                self._append_log("[auto] Palette re-applied for new wallpaper.")
+            return
 
         if notify_ok and restarted:
             QMessageBox.information(
@@ -965,6 +1329,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt API)
         """Make sure background threads do not keep the process alive."""
+        if hasattr(self, "_wallpaper_poll_timer"):
+            self._wallpaper_poll_timer.stop()
+        if hasattr(self, "_wallpaper_debounce_timer"):
+            self._wallpaper_debounce_timer.stop()
         thread = self._thread
         if thread is not None and thread.isRunning():
             self._logger.info("closeEvent: stopping worker thread")

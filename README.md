@@ -39,6 +39,8 @@ python -m plasmacolorizer
 ## Usage notes
 
 - **Wallpaper detection** works best with the standard **Image** wallpaper plugin (`org.kde.image`). Other plugins may not expose a file path; use the “Override” field to point at an image.
+- **Cohesive KDE theming** (Colorizer tab): when **Apply palette to Konsole** is enabled (default), PlasmaColorizer writes `~/.local/share/konsole/PlasmaColorizer.colorscheme`, points your **default** Konsole profile (`DefaultProfile` in `~/.config/konsolerc`) at it, and reloads open Konsole windows. **Point Dolphin at system color scheme** (default on) clears stale per-app pins in `~/.config/dolphinrc` (e.g. `MaterialYouDark` left by kde-material-you-colors) so Dolphin follows the global `PlasmaColorizer` scheme. **Dolphin and Breeze title bars** are updated via `plasma-apply-colorscheme` (with a reload stub so KDE picks up changes even when the scheme name stays `PlasmaColorizer`). After the first apply, **close and reopen Dolphin** if an already-open window still shows old colours.
+- **Wallpaper auto-apply**: enable **Run wallpaper watcher at login** (default on) to install `plasmacolorizer-daemon` — it polls the main-screen wallpaper every few seconds and re-applies the palette when it changes, even when the UI is closed. While the app is open, the in-app poll is used only when the background watcher is disabled. Manual **Override** paths are ignored by the watcher. Auto-apply runs are logged with `[auto]` / `[daemon]` prefixes.
 - **Dark / light** for generated Material schemes: choose *Follow KDE* (reads `ColorScheme` in `~/.config/kdeglobals`), or force dark/light.
 - **Conky tab** fills tokens such as `{{primary}}`, `{{on_surface}}`, `{{surface}}`, etc., from the **effective** palette (Colorizer tab, including swatch overrides).
 - **Bundled presets** (Start / Stop per preset, **Stop all**, **Apply colors to running Conkys**):
@@ -65,6 +67,33 @@ python -m plasmacolorizer
 ```bash
 pytest
 ```
+
+**Wallpaper watcher daemon** (optional CLI):
+
+```bash
+plasmacolorizer-daemon --foreground   # run in a terminal
+plasmacolorizer-daemon --stop           # stop background watcher
+plasmacolorizer-daemon --install-autostart
+```
+
+## Troubleshooting
+
+### KDE panel opacity (Solid / Adaptive / Translucent)
+
+Plasma 6 stores panel opacity as an integer mode in `~/.config/plasmashellrc` (`0` = Adaptive, `1` = Solid, `2` = Translucent). This is **not** a continuous alpha slider like Conky.
+
+**All three modes look identical:** The PlasmaColorizer Plasma Style ships a `plasmarc` under `~/.local/share/plasma/desktoptheme/PlasmaColorizer/`. If that file contains `[AdaptiveTransparency]` or `[ContrastEffect]` — even with `enabled=false` — Plasma ignores the per-panel opacity mode and renders every choice the same. The theme `plasmarc` must contain only:
+
+```ini
+[Settings]
+FallbackTheme=default
+```
+
+On the Colorizer tab, use **Diagnose panel opacity** and **Repair theme for panel opacity** (or re-apply a scheme, which regenerates a minimal `plasmarc`). Then switch Solid ↔ Translucent; plasmashell restarts briefly so the panel picks up the change.
+
+**Translucent looks subtle:** Enable KWin blur (System Settings → Apps & Windows → Window Management → Desktop Effects) and use a wallpaper with contrast behind the panel. Third-party panel styling tools (`kde-material-you-colors`, luisbocanegra panel widgets) can paint their own background and hide native opacity — remove or pause them first.
+
+**Manual check:** After repair, `plasmashellrc` should show `panelOpacity=1` (Solid) or `panelOpacity=2` (Translucent). Switching to stock `breeze-dark` Plasma Style and comparing Solid vs Translucent isolates whether the issue is theme-side.
 
 ## GitHub
 
