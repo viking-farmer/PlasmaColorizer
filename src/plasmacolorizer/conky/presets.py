@@ -166,6 +166,31 @@ def _system_stats_body(style: str, pal: MaterialPalette) -> str:
     )
 
 
+def _escape_conky_text(value: str) -> str:
+    """Neutralize Conky control sequences in user-provided text.
+
+    ``$`` starts a variable (``${...}`` / ``$var``); ``$$`` emits a literal ``$``.
+    Newlines would split one shortcut into several lines, so collapse them.
+    """
+    return value.replace("$", "$$").replace("\n", " ").replace("\r", " ").strip()
+
+
+def _shortcuts_body(settings) -> str:
+    """Render the editable shortcut rows as ``${color1}Label${alignr}Keys`` lines."""
+    shortcuts = getattr(settings, "conky_shortcuts", None) or []
+    lines: list[str] = []
+    for sc in shortcuts:
+        label = _escape_conky_text(str(getattr(sc, "label", "") or ""))
+        keys = _escape_conky_text(str(getattr(sc, "keys", "") or ""))
+        if not label and not keys:
+            continue
+        if keys:
+            lines.append(f"${{color1}}{label}${{alignr}}{keys}")
+        else:
+            lines.append(f"${{color1}}{label}")
+    return "\n".join(lines)
+
+
 def resolve_system_widget_style(settings) -> str:
     """Effective CPU/RAM widget style: theme override → user setting → ``text``."""
     theme = get_theme(getattr(settings, "conky_theme_id", None))
@@ -196,6 +221,7 @@ def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) 
     style = resolve_system_widget_style(settings)
     ctx["system_stats_body"] = _system_stats_body(style, pal)
     ctx["system_min_width"] = "280" if style in ("bar", "graph") else "220"
+    ctx["shortcuts_body"] = _shortcuts_body(settings)
     if preset_id is not None and preset_id in PRESETS:
         ctx["conky_alignment"] = alignment_for_preset(preset_id)
     else:

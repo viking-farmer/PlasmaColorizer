@@ -13,6 +13,41 @@ _SYSTEM_STATS_STYLES = frozenset({"text", "bar", "graph"})
 
 
 @dataclass
+class ConkyShortcut:
+    """A single entry in the editable Shortcuts Conky widget."""
+
+    label: str = ""
+    keys: str = ""
+
+    def to_json_dict(self) -> dict[str, str]:
+        return {"label": self.label, "keys": self.keys}
+
+    @classmethod
+    def from_json_dict(cls, data: Any) -> "ConkyShortcut | None":
+        if not isinstance(data, dict):
+            return None
+        label = str(data.get("label") or "").strip()
+        keys = str(data.get("keys") or "").strip()
+        if not label and not keys:
+            return None
+        return cls(label=label, keys=keys)
+
+
+def default_conky_shortcuts() -> list[ConkyShortcut]:
+    """Bundled defaults shown until the user customizes the Shortcuts widget."""
+    return [
+        ConkyShortcut("Launcher", "Meta"),
+        ConkyShortcut("Overview", "Meta+W"),
+        ConkyShortcut("Clipboard", "Meta+V"),
+        ConkyShortcut("Screenshot", "Meta+Print"),
+        ConkyShortcut("Lock", "Meta+L"),
+        ConkyShortcut("Konsole", "Meta+T"),
+        ConkyShortcut("Settings", "Meta+,"),
+        ConkyShortcut("Close window", "Meta+Shift+W"),
+    ]
+
+
+@dataclass
 class ConkySettings:
     esv_api_key: str = ""
     weather_city: str = ""
@@ -31,6 +66,8 @@ class ConkySettings:
     autostart_preset_ids: list[str] = field(default_factory=list)
     # Visual theme id (see ``plasmacolorizer.conky.themes.THEMES``); colors stay palette-driven.
     conky_theme_id: str = "material"
+    # Editable entries for the bundled "shortcuts" preset (label + key combo).
+    conky_shortcuts: list[ConkyShortcut] = field(default_factory=default_conky_shortcuts)
 
     def to_json_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -52,6 +89,7 @@ class ConkySettings:
             autostart_enabled=_opt_bool_with_default(data.get("autostart_enabled"), default=True),
             autostart_preset_ids=_opt_str_list(data.get("autostart_preset_ids")),
             conky_theme_id=_opt_theme_id(data.get("conky_theme_id")),
+            conky_shortcuts=_opt_shortcuts(data.get("conky_shortcuts")),
         )
 
 
@@ -109,6 +147,21 @@ def _opt_str_list(v: Any) -> list[str]:
     if not isinstance(v, list):
         return []
     return [x for x in v if isinstance(x, str)]
+
+
+def _opt_shortcuts(v: Any) -> list[ConkyShortcut]:
+    # Missing key (older settings files) → bundled defaults.
+    # Present-but-empty list → the user intentionally cleared every shortcut.
+    if v is None:
+        return default_conky_shortcuts()
+    if not isinstance(v, list):
+        return default_conky_shortcuts()
+    out: list[ConkyShortcut] = []
+    for item in v:
+        sc = ConkyShortcut.from_json_dict(item)
+        if sc is not None:
+            out.append(sc)
+    return out
 
 
 def _opt_theme_id(v: Any) -> str:

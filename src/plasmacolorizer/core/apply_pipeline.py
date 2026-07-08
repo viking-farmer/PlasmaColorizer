@@ -14,6 +14,7 @@ from plasmacolorizer.core.logger import get_logger
 from plasmacolorizer.core.palette import MaterialPalette
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core.plasma_scheme import DiskApplyResult, SchemeApplyChoices
+from plasmacolorizer.core.wallpaper_watch import record_applied_wallpaper_fingerprint
 from plasmacolorizer.workers import compute_material_palette_from_wallpaper
 
 
@@ -123,6 +124,8 @@ def generate_and_apply_from_wallpaper(
         restart_msg = ""
         if app.restart_plasma_after_apply or app.plasma_panel_opacity_mode != "opaque":
             restarted, restart_msg = plasma_scheme.restart_plasmashell()
+
+        record_applied_wallpaper_fingerprint(src)
 
     return PipelineResult(
         src=src,

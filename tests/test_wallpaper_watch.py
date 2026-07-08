@@ -48,3 +48,17 @@ def test_wallpaper_fingerprint_monitor(
     from plasmacolorizer.core.wallpaper_watch import wallpaper_fingerprint
 
     assert wallpaper_fingerprint(0) == wallpaper_fingerprint_for_path(str(img))
+
+
+def test_record_applied_wallpaper_fingerprint_persists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    img = tmp_path / "wall.jpg"
+    img.write_bytes(b"wall")
+    from plasmacolorizer.core.wallpaper_watch import record_applied_wallpaper_fingerprint
+    from plasmacolorizer.core.app_settings import load_app_settings
+
+    fp = record_applied_wallpaper_fingerprint(str(img))
+    assert fp is not None
+    assert load_app_settings().last_applied_wallpaper_fingerprint == fp

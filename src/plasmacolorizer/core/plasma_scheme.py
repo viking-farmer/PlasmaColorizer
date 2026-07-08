@@ -44,8 +44,9 @@ from plasmacolorizer.core.dolphin_prefs import (
     dolphin_cohesion_warnings,
     patch_dolphin_follow_system_colorscheme,
 )
-from plasmacolorizer.core.konsole_scheme import apply_konsole_scheme, konsole_cohesion_warnings
+from plasmacolorizer.core.konsole_scheme import konsole_cohesion_warnings
 from plasmacolorizer.core.palette import MaterialPalette, rgb_to_hex, rgb_tuple_to_argb_u
+from plasmacolorizer.core.terminals import apply_terminal_theme
 
 _MATERIAL_NAMES = frozenset(COLOR_NAMES)
 _PRIMARY_TRIO = ("primary", "primaryDim", "onPrimary")
@@ -1296,7 +1297,7 @@ def apply_material_palette_to_disk(
     konsole_err = ""
     if app.apply_konsole_scheme:
         try:
-            k_ok, k_msg = apply_konsole_scheme(pal)
+            k_ok, k_msg = apply_terminal_theme(pal)
             if not k_ok:
                 konsole_err = k_msg
         except Exception as exc:  # noqa: BLE001

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import sys
 import time
@@ -23,15 +24,22 @@ from plasmacolorizer.core.wallpaper_watch import (
     wallpaper_fingerprint,
 )
 
-PID_DIR = Path(os.path.expanduser("~/.cache/plasmacolorizer"))
-PID_FILE = PID_DIR / "daemon.pid"
-AUTOSTART_DIR = Path(os.path.expanduser("~/.config/autostart"))
+PID_DIR_NAME = ".cache/plasmacolorizer"
+AUTOSTART_DIR_NAME = ".config/autostart"
 AUTOSTART_FILE = "plasmacolorizer-daemon.desktop"
 _STOP = False
 
 
+def pid_dir() -> Path:
+    return Path(os.path.expanduser(f"~/{PID_DIR_NAME}"))
+
+
 def pid_file_path() -> Path:
-    return PID_FILE
+    return pid_dir() / "daemon.pid"
+
+
+def autostart_dir() -> Path:
+    return Path(os.path.expanduser(f"~/{AUTOSTART_DIR_NAME}"))
 
 
 def is_daemon_running() -> bool:
@@ -67,7 +75,7 @@ def stop_daemon() -> bool:
 
 
 def _write_pid() -> None:
-    PID_DIR.mkdir(parents=True, exist_ok=True)
+    pid_dir().mkdir(parents=True, exist_ok=True)
     pid_file_path().write_text(str(os.getpid()), encoding="utf-8")
 
 
@@ -76,17 +84,28 @@ def _remove_pid() -> None:
 
 
 def autostart_desktop_path() -> Path:
-    return AUTOSTART_DIR / AUTOSTART_FILE
+    return autostart_dir() / AUTOSTART_FILE
+
+
+def resolve_daemon_executable() -> str:
+    """Return ``plasmacolorizer-daemon`` on PATH, or the script next to ``sys.executable``."""
+    found = shutil.which("plasmacolorizer-daemon")
+    if found:
+        return found
+    candidate = Path(sys.executable).resolve().parent / "plasmacolorizer-daemon"
+    if candidate.is_file():
+        return str(candidate)
+    return f"{sys.executable} -m plasmacolorizer.wallpaper_daemon"
 
 
 def autostart_desktop_contents() -> str:
-    exe = Path(sys.executable).resolve()
+    exe = resolve_daemon_executable()
     return (
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Name=PlasmaColorizer wallpaper watcher\n"
         "Comment=Re-apply Material You colors when the Plasma wallpaper changes\n"
-        f"Exec={exe} -m plasmacolorizer.wallpaper_daemon\n"
+        f"Exec={exe}\n"
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"
         "X-KDE-autostart-phase=2\n"
@@ -95,6 +114,7 @@ def autostart_desktop_contents() -> str:
 
 
 def install_autostart() -> Path:
+    """Write (or refresh) the autostart ``.desktop`` file. Returns its path."""
     path = autostart_desktop_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(autostart_desktop_contents(), encoding="utf-8")
@@ -122,12 +142,16 @@ def _handle_stop(signum: int, _frame) -> None:  # noqa: ANN001
 def run_loop(app: AppSettings | None = None) -> int:
     log = get_logger()
     settings = app or load_app_settings()
-    log.info("PlasmaColorizer wallpaper daemon started (monitor=%s)", settings.wallpaper_monitor)
-    last_fp: str | None = None
+    log.info(
+        "PlasmaColorizer wallpaper daemon started (monitor=%s, poll=%ss)",
+        settings.wallpaper_monitor,
+        settings.wallpaper_daemon_poll_interval_s,
+    )
     pending_fp: str | None = None
     pending_since: float | None = None
     debounce_s = WALLPAPER_CHANGE_DEBOUNCE_MS / 1000.0
     interval = max(1.0, float(settings.wallpaper_daemon_poll_interval_s))
+    null_fp_streak = 0
 
     while not _STOP:
         settings = load_app_settings()
@@ -141,41 +165,56 @@ def run_loop(app: AppSettings | None = None) -> int:
         fp = wallpaper_fingerprint(settings.wallpaper_monitor)
         now = time.monotonic()
         if fp is None:
+            null_fp_streak += 1
+            if null_fp_streak == 1 or null_fp_streak % 20 == 0:
+                log.warning(
+                    "[daemon] cannot resolve wallpaper (DBus/plasmashell unavailable?) — "
+                    "retrying every %.0fs",
+                    interval,
+                )
+            time.sleep(interval)
+            continue
+        null_fp_streak = 0
+
+        applied = settings.last_applied_wallpaper_fingerprint
+        if fp == applied:
+            pending_fp = None
+            pending_since = None
             time.sleep(interval)
             continue
 
-        if last_fp is None:
-            last_fp = fp
-            time.sleep(interval)
-            continue
-
-        if fp != last_fp:
-            if pending_fp != fp:
-                pending_fp = fp
-                pending_since = now
-                log.info("Wallpaper change detected; debouncing %.1fs", debounce_s)
-            elif pending_since is not None and (now - pending_since) >= debounce_s:
-                try:
-                    log.info("Auto-applying palette for new wallpaper")
-                    result = generate_and_apply_from_wallpaper(
-                        app_settings=settings,
-                        log_prefix="[daemon]",
+        if pending_fp != fp:
+            pending_fp = fp
+            pending_since = now
+            if applied:
+                log.info(
+                    "[daemon] wallpaper changed; debouncing %.1fs before apply",
+                    debounce_s,
+                )
+            else:
+                log.info(
+                    "[daemon] no prior apply recorded for current wallpaper; "
+                    "debouncing %.1fs before first apply",
+                    debounce_s,
+                )
+        elif pending_since is not None and (now - pending_since) >= debounce_s:
+            try:
+                log.info("[daemon] auto-applying palette")
+                result = generate_and_apply_from_wallpaper(
+                    app_settings=settings,
+                    log_prefix="[daemon]",
+                )
+                if not result.disk.apply_ok:
+                    log.warning("[daemon] apply failed: %s", result.disk.apply_error)
+                else:
+                    log.info(
+                        "[daemon] applied %s; notify=%s; plasma_restart=%s",
+                        result.src,
+                        result.notify_msg,
+                        result.restart_msg or "skipped",
                     )
-                    if not result.disk.apply_ok:
-                        log.warning("[daemon] apply failed: %s", result.disk.apply_error)
-                    else:
-                        log.info(
-                            "[daemon] applied %s; notify=%s; plasma_restart=%s",
-                            result.src,
-                            result.notify_msg,
-                            result.restart_msg or "skipped",
-                        )
-                    last_fp = fp
-                except Exception as exc:  # noqa: BLE001
-                    log.exception("[daemon] auto-apply failed: %s", exc)
-                pending_fp = None
-                pending_since = None
-        else:
+            except Exception as exc:  # noqa: BLE001
+                log.exception("[daemon] auto-apply failed: %s", exc)
             pending_fp = None
             pending_since = None
 

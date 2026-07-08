@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from plasmacolorizer.conky import presets
-from plasmacolorizer.conky.settings_store import ConkySettings, save_conky_settings
+from plasmacolorizer.conky.settings_store import (
+    ConkyShortcut,
+    ConkySettings,
+    default_conky_shortcuts,
+    load_conky_settings,
+    save_conky_settings,
+)
 from plasmacolorizer.core.palette import MaterialPalette
 
 
@@ -208,3 +214,86 @@ def test_render_system_preset_graph(monkeypatch: pytest.MonkeyPatch, tmp_path) -
     assert "cpugraph" in body
     assert "memgraph" in body
     assert "minimum_width = 280" in body
+
+
+def test_shortcuts_default_body_renders_bundled_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    body = presets.render_preset("shortcuts", _minimal_palette()).read_text(encoding="utf-8")
+    assert "{{shortcuts_body}}" not in body
+    assert "${color1}Launcher${alignr}Meta" in body
+    assert "${color1}Close window${alignr}Meta+Shift+W" in body
+
+
+def test_shortcuts_body_uses_custom_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_conky_settings(
+        ConkySettings(
+            conky_shortcuts=[
+                ConkyShortcut("Terminal", "Ctrl+Alt+T"),
+                ConkyShortcut("Files", "Meta+E"),
+            ]
+        )
+    )
+    body = presets.render_preset("shortcuts", _minimal_palette()).read_text(encoding="utf-8")
+    assert "${color1}Terminal${alignr}Ctrl+Alt+T" in body
+    assert "${color1}Files${alignr}Meta+E" in body
+    # Bundled defaults must not leak in once the user has customized.
+    assert "Launcher" not in body
+
+
+def test_shortcuts_body_empty_list_renders_no_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_conky_settings(ConkySettings(conky_shortcuts=[]))
+    body = presets.render_preset("shortcuts", _minimal_palette()).read_text(encoding="utf-8")
+    assert "${alignr}" not in body
+    assert "{{shortcuts_body}}" not in body
+
+
+def test_shortcuts_body_label_only_omits_alignr() -> None:
+    ctx = presets.build_render_context(
+        _minimal_palette(),
+    )
+    # Direct helper check: a label with no keys renders without the ${alignr} split.
+    line = presets._shortcuts_body(
+        ConkySettings(conky_shortcuts=[ConkyShortcut("Heading", "")])
+    )
+    assert line == "${color1}Heading"
+    assert isinstance(ctx, dict)
+
+
+def test_shortcuts_body_escapes_dollar_signs() -> None:
+    line = presets._shortcuts_body(
+        ConkySettings(conky_shortcuts=[ConkyShortcut("Cost", "$5")])
+    )
+    # A literal '$' must become '$$' so Conky does not treat it as a variable.
+    assert "$$5" in line
+    assert "${color1}Cost${alignr}$$5" == line
+
+
+def test_shortcuts_roundtrip_through_settings_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    save_conky_settings(
+        ConkySettings(conky_shortcuts=[ConkyShortcut("Lock", "Meta+L")])
+    )
+    loaded = load_conky_settings()
+    assert loaded.conky_shortcuts == [ConkyShortcut("Lock", "Meta+L")]
+
+
+def test_shortcuts_missing_key_falls_back_to_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Simulate an older settings.json without the conky_shortcuts key.
+    path = tmp_path / ".config/plasmacolorizer/settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"conky_theme_id": "material"}', encoding="utf-8")
+    loaded = load_conky_settings()
+    assert loaded.conky_shortcuts == default_conky_shortcuts()

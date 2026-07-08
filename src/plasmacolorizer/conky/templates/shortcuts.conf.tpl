@@ -32,12 +32,5 @@ conky.config = {
 
 conky.text = [[
 ${color1}{{theme_title_open}}Shortcuts{{theme_title_close}}${color2}{{theme_section_divider}}
-${color1}Launcher${alignr}Meta
-${color1}Overview${alignr}Meta+W
-${color1}Clipboard${alignr}Meta+V
-${color1}Screenshot${alignr}Meta+Print
-${color1}Lock${alignr}Meta+L
-${color1}Konsole${alignr}Meta+T
-${color1}Settings${alignr}Meta+,
-${color1}Close window${alignr}Meta+Shift+W
+{{shortcuts_body}}
 ]]

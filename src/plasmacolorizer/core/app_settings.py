@@ -39,6 +39,8 @@ class AppSettings:
     scheme_emphasis: str = "secondary"
     scheme_links: str = ""
     restart_plasma_after_apply: bool = True
+    # Fingerprint of the wallpaper image last written to disk (daemon sync).
+    last_applied_wallpaper_fingerprint: str = ""
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,6 +90,9 @@ class AppSettings:
             restart_plasma_after_apply=_opt_bool(
                 data.get("restart_plasma_after_apply"), default=True,
             ),
+            last_applied_wallpaper_fingerprint=str(
+                data.get("last_applied_wallpaper_fingerprint") or "",
+            ).strip(),
         )
 
 

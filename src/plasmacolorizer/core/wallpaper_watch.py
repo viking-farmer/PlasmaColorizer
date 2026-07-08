@@ -37,3 +37,25 @@ def wallpaper_fingerprint(monitor: int = 0, *, prefer_light: bool = False) -> st
 def wallpaper_watch_skipped(manual_override: str) -> bool:
     """Skip auto-apply when the user pinned an explicit override path."""
     return bool(manual_override.strip())
+
+
+def record_applied_wallpaper_fingerprint(
+    src_path: str | None = None,
+    *,
+    monitor: int = 0,
+) -> str | None:
+    """Persist the fingerprint of the wallpaper we last applied successfully."""
+    from plasmacolorizer.core.app_settings import load_app_settings, save_app_settings
+
+    if src_path:
+        fp = wallpaper_fingerprint_for_path(src_path)
+    else:
+        fp = wallpaper_fingerprint(monitor)
+    if not fp:
+        return None
+    app = load_app_settings()
+    if app.last_applied_wallpaper_fingerprint == fp:
+        return fp
+    app.last_applied_wallpaper_fingerprint = fp
+    save_app_settings(app)
+    return fp

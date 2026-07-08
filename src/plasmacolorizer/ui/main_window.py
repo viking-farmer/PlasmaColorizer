@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QPoint, QSize, Qt, QThread, QTimer, QUrl
-from PyQt6.QtGui import QColor, QCloseEvent, QDesktopServices
+from PyQt6.QtGui import QColor, QCloseEvent, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -28,6 +33,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextEdit,
     QToolButton,
@@ -39,7 +46,13 @@ from plasmacolorizer.conky import presets as conky_presets
 from plasmacolorizer.conky import themes as conky_themes
 from plasmacolorizer.conky.fetch import GeocodeHit
 from plasmacolorizer.conky.weather_locations import WEATHER_PRESETS
-from plasmacolorizer.conky.settings_store import ConkySettings, load_conky_settings, save_conky_settings
+from plasmacolorizer.conky.settings_store import (
+    ConkyShortcut,
+    ConkySettings,
+    default_conky_shortcuts,
+    load_conky_settings,
+    save_conky_settings,
+)
 from plasmacolorizer.conky.templating import render_template
 from plasmacolorizer.core import plasma_scheme
 from plasmacolorizer.core import wallpaper as wp
@@ -47,6 +60,7 @@ from plasmacolorizer.core.app_settings import AppSettings, load_app_settings, sa
 from plasmacolorizer.core.wallpaper_watch import (
     WALLPAPER_CHANGE_DEBOUNCE_MS,
     WALLPAPER_POLL_INTERVAL_MS,
+    record_applied_wallpaper_fingerprint,
     wallpaper_fingerprint,
     wallpaper_fingerprint_for_path,
     wallpaper_watch_skipped,
@@ -66,6 +80,13 @@ from plasmacolorizer.core.component_colors import (
 from plasmacolorizer.core.logger import get_logger, log_file_path
 from plasmacolorizer.core.palette import MaterialPalette, merge_palette_color_overrides, rgb_to_hex
 from plasmacolorizer.core.plasma_scheme import SchemeApplyChoices, str_to_panel_opacity_mode
+from plasmacolorizer.core import terminals as terminal_backends
+from plasmacolorizer.core.terminal_settings import (
+    TerminalSettings,
+    load_terminal_settings,
+    parse_hex_rgb,
+    save_terminal_settings,
+)
 from plasmacolorizer.ui.component_color_dialog import ComponentColorDialog
 from plasmacolorizer.workers import (
     ApplyPaletteWorker,
@@ -103,8 +124,10 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         log_tab = self._build_log_tab()
         color_tab = self._build_color_tab()
+        terminal_tab = self._build_terminal_tab()
         conky_tab = self._build_conky_tab()
         tabs.addTab(color_tab, "Colorizer")
+        tabs.addTab(terminal_tab, "Terminal")
         tabs.addTab(conky_tab, "Conky")
         tabs.addTab(log_tab, "Log")
         self.setCentralWidget(tabs)
@@ -707,12 +730,16 @@ class MainWindow(QMainWindow):
         import subprocess
         import sys
 
-        subprocess.Popen(
-            [sys.executable, "-m", "plasmacolorizer.wallpaper_daemon"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "plasmacolorizer.wallpaper_daemon"],
+                env=os.environ.copy(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self._logger.warning("Could not start wallpaper daemon: %s", exc)
 
     def _update_daemon_status_label(self) -> None:
         if self._wallpaper_daemon.isChecked():
@@ -797,6 +824,8 @@ class MainWindow(QMainWindow):
     def _refresh_color_previews(self, pal: MaterialPalette | None = None) -> None:
         self._update_palette_swatches(pal)
         self._update_component_color_swatches()
+        if hasattr(self, "_term_preview"):
+            self._term_update_preview()
 
     def _effective_scheme_sections(self) -> dict[str, dict[str, str]] | None:
         eff = self._effective_palette()
@@ -1275,6 +1304,7 @@ class MainWindow(QMainWindow):
         self._save_app_settings_from_ui()
         try:
             self._last_wallpaper_fingerprint = wallpaper_fingerprint_for_path(str(result.src))
+            record_applied_wallpaper_fingerprint(str(result.src))
         except OSError:
             pass
         self._ensure_wallpaper_daemon_running()
@@ -1343,6 +1373,342 @@ class MainWindow(QMainWindow):
                 thread.wait(1000)
         self._logger.info("closeEvent: accepting close")
         super().closeEvent(event)
+
+    # --- Terminal tab --------------------------------------------------
+    def _build_terminal_tab(self) -> QWidget:
+        self._term_overrides: dict[str, str] = {
+            "background": "",
+            "foreground": "",
+            "accent": "",
+        }
+
+        wrap = QWidget()
+        root = QVBoxLayout(wrap)
+
+        intro = QLabel(
+            "Theme your terminal from the current wallpaper palette. Colors follow "
+            "the Colorizer tab automatically; the controls below let you tweak the "
+            "font, transparency, and pin specific colors. <b>Konsole</b> is the KDE "
+            "default; other terminals appear here when they're installed."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(intro)
+
+        term_box = QGroupBox("Terminal")
+        term_form = QFormLayout()
+        self._term_combo = QComboBox()
+        installed = set(terminal_backends.installed_terminals())
+        for tid, backend in terminal_backends.TERMINALS.items():
+            is_here = tid in installed
+            label = backend.label if is_here else f"{backend.label}  (not installed)"
+            self._term_combo.addItem(label, tid)
+            if not is_here and tid != "konsole":
+                idx = self._term_combo.count() - 1
+                model = self._term_combo.model()
+                model.item(idx).setEnabled(False)
+        self._term_combo.currentIndexChanged.connect(self._term_update_preview)
+        term_form.addRow("Terminal", self._term_combo)
+        term_box.setLayout(term_form)
+        root.addWidget(term_box)
+
+        appearance = QGroupBox("Font & transparency")
+        appearance_form = QFormLayout()
+
+        self._term_font_enabled = QCheckBox("Use a custom font")
+        self._term_font_enabled.toggled.connect(self._on_term_font_toggled)
+        appearance_form.addRow("", self._term_font_enabled)
+
+        self._term_font_combo = QFontComboBox()
+        self._term_font_combo.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
+        self._term_font_combo.currentFontChanged.connect(self._term_update_preview)
+        appearance_form.addRow("Font family", self._term_font_combo)
+
+        self._term_font_size = QDoubleSpinBox()
+        self._term_font_size.setRange(5.0, 72.0)
+        self._term_font_size.setDecimals(1)
+        self._term_font_size.setSingleStep(0.5)
+        self._term_font_size.setValue(11.0)
+        self._term_font_size.valueChanged.connect(self._term_update_preview)
+        appearance_form.addRow("Font size", self._term_font_size)
+
+        self._term_bold_intense = QCheckBox(
+            "Use bright colors for bold text (BoldIntenseColors)"
+        )
+        self._term_bold_intense.setChecked(True)
+        self._term_bold_intense.toggled.connect(self._term_update_preview)
+        appearance_form.addRow("", self._term_bold_intense)
+
+        self._term_opacity = QSlider(Qt.Orientation.Horizontal)
+        self._term_opacity.setRange(0, 100)
+        self._term_opacity.setValue(100)
+        self._term_opacity.setToolTip(
+            "Terminal background opacity. 100% is solid; lower values let the "
+            "wallpaper show through (needs a compositor)."
+        )
+        self._term_opacity_label = QLabel("100%")
+        self._term_opacity_label.setMinimumWidth(44)
+        self._term_opacity.valueChanged.connect(self._on_term_opacity_changed)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(self._term_opacity, 1)
+        opacity_row.addWidget(self._term_opacity_label)
+        appearance_form.addRow("Background opacity", opacity_row)
+        appearance.setLayout(appearance_form)
+        root.addWidget(appearance)
+
+        colors = QGroupBox("Color overrides")
+        colors_layout = QVBoxLayout()
+        ch = QLabel(
+            "Leave these off to derive every color from the wallpaper. Turn one on "
+            "to pin a specific background, text, or accent (cursor) color."
+        )
+        ch.setWordWrap(True)
+        colors_layout.addWidget(ch)
+
+        self._term_color_checks: dict[str, QCheckBox] = {}
+        self._term_color_buttons: dict[str, QToolButton] = {}
+        for key, label in (
+            ("background", "Background"),
+            ("foreground", "Text"),
+            ("accent", "Accent / cursor"),
+        ):
+            row = QHBoxLayout()
+            check = QCheckBox(f"Custom {label.lower()}")
+            check.toggled.connect(lambda _c, k=key: self._on_term_override_toggled(k))
+            btn = QToolButton()
+            btn.setFixedSize(QSize(48, 24))
+            btn.setToolTip(f"Click to choose the {label.lower()} color")
+            btn.clicked.connect(lambda _c=False, k=key: self._term_pick_color(k))
+            self._term_color_checks[key] = check
+            self._term_color_buttons[key] = btn
+            row.addWidget(check)
+            row.addWidget(btn)
+            row.addStretch(1)
+            colors_layout.addLayout(row)
+        colors.setLayout(colors_layout)
+        root.addWidget(colors)
+
+        preview_box = QGroupBox("Preview")
+        preview_layout = QVBoxLayout()
+        self._term_preview = QTextEdit()
+        self._term_preview.setReadOnly(True)
+        self._term_preview.setMinimumHeight(150)
+        preview_layout.addWidget(self._term_preview)
+        preview_box.setLayout(preview_layout)
+        root.addWidget(preview_box)
+
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply to terminal")
+        apply_btn.setToolTip("Write the scheme and reload the selected terminal now.")
+        apply_btn.clicked.connect(self._term_apply_clicked)
+        save_btn = QPushButton("Save settings")
+        save_btn.setObjectName("secondary")
+        save_btn.clicked.connect(self._term_save_clicked)
+        reset_btn = QPushButton("Reset to defaults")
+        reset_btn.setObjectName("secondary")
+        reset_btn.clicked.connect(self._term_reset_clicked)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+        root.addStretch(1)
+
+        self._term_load_into_fields(load_terminal_settings())
+        return wrap
+
+    def _combo_select_data(self, combo: QComboBox, value: str) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return
+
+    def _term_load_into_fields(self, s: TerminalSettings) -> None:
+        widgets = (
+            self._term_combo,
+            self._term_font_enabled,
+            self._term_font_combo,
+            self._term_font_size,
+            self._term_bold_intense,
+            self._term_opacity,
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self._combo_select_data(self._term_combo, s.terminal_id)
+            has_font = bool(s.font_family)
+            self._term_font_enabled.setChecked(has_font)
+            if has_font:
+                self._term_font_combo.setCurrentFont(QFont(s.font_family))
+            self._term_font_combo.setEnabled(has_font)
+            self._term_font_size.setValue(float(s.font_size))
+            self._term_bold_intense.setChecked(bool(s.bold_intense))
+            pct = max(0, min(100, round(float(s.opacity) * 100)))
+            self._term_opacity.setValue(pct)
+            self._term_opacity_label.setText(f"{pct}%")
+            self._term_overrides = {
+                "background": s.background_override,
+                "foreground": s.foreground_override,
+                "accent": s.accent_override,
+            }
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        for key, value in self._term_overrides.items():
+            check = self._term_color_checks[key]
+            check.blockSignals(True)
+            check.setChecked(bool(value))
+            check.blockSignals(False)
+            self._term_color_buttons[key].setEnabled(bool(value))
+        self._refresh_term_color_buttons()
+        self._term_update_preview()
+
+    def _on_term_font_toggled(self, checked: bool) -> None:
+        self._term_font_combo.setEnabled(checked)
+        self._term_update_preview()
+
+    def _on_term_opacity_changed(self, value: int) -> None:
+        self._term_opacity_label.setText(f"{value}%")
+        self._term_update_preview()
+
+    def _on_term_override_toggled(self, key: str) -> None:
+        checked = self._term_color_checks[key].isChecked()
+        self._term_color_buttons[key].setEnabled(checked)
+        if not checked:
+            self._term_overrides[key] = ""
+        elif not self._term_overrides.get(key):
+            # Seed the override from the current effective color so the picker starts there.
+            self._term_overrides[key] = self._term_effective_hex(key) or "#1e1e28"
+        self._refresh_term_color_buttons()
+        self._term_update_preview()
+
+    def _term_effective_hex(self, key: str) -> str:
+        pal = self._effective_palette()
+        if pal is None:
+            return ""
+        colors = terminal_backends.resolve_terminal_colors(
+            pal, self._term_settings_from_fields()
+        )
+        rgb = {
+            "background": colors.background,
+            "foreground": colors.foreground,
+            "accent": colors.cursor,
+        }[key]
+        return rgb_to_hex(rgb)
+
+    def _term_pick_color(self, key: str) -> None:
+        current = self._term_overrides.get(key) or self._term_effective_hex(key) or "#1e1e28"
+        rgb = parse_hex_rgb(current) or (30, 30, 40)
+        chosen = QColorDialog.getColor(
+            QColor(*rgb), self, f"Choose {key} color"
+        )
+        if not chosen.isValid():
+            return
+        self._term_overrides[key] = chosen.name()
+        self._term_color_checks[key].setChecked(True)
+        self._term_color_buttons[key].setEnabled(True)
+        self._refresh_term_color_buttons()
+        self._term_update_preview()
+
+    def _refresh_term_color_buttons(self) -> None:
+        for key, btn in self._term_color_buttons.items():
+            hexv = self._term_overrides.get(key) or self._term_effective_hex(key)
+            if hexv:
+                btn.setStyleSheet(
+                    f"QToolButton {{ background-color: {hexv}; "
+                    "border: 1px solid #555; border-radius: 4px; }}"
+                )
+                btn.setToolTip(f"{key}: {hexv}")
+            else:
+                btn.setStyleSheet(
+                    "QToolButton { background: #2a2a32; border: 1px solid #444; "
+                    "border-radius: 4px; }"
+                )
+
+    def _term_settings_from_fields(self) -> TerminalSettings:
+        font_family = ""
+        if self._term_font_enabled.isChecked():
+            font_family = self._term_font_combo.currentFont().family()
+        return TerminalSettings(
+            terminal_id=str(self._term_combo.currentData() or "konsole"),
+            font_family=font_family,
+            font_size=float(self._term_font_size.value()),
+            bold_intense=bool(self._term_bold_intense.isChecked()),
+            background_override=self._term_overrides.get("background", ""),
+            foreground_override=self._term_overrides.get("foreground", ""),
+            accent_override=self._term_overrides.get("accent", ""),
+            opacity=self._term_opacity.value() / 100.0,
+        )
+
+    def _term_update_preview(self, *_args) -> None:
+        if not hasattr(self, "_term_preview"):
+            return
+        self._refresh_term_color_buttons()
+        pal = self._effective_palette()
+        if pal is None:
+            self._term_preview.setHtml(
+                "<i>Generate a palette on the Colorizer tab to preview the terminal.</i>"
+            )
+            return
+        settings = self._term_settings_from_fields()
+        colors = terminal_backends.resolve_terminal_colors(pal, settings)
+        bg = rgb_to_hex(colors.background)
+        fg = rgb_to_hex(colors.foreground)
+        cursor = rgb_to_hex(colors.cursor)
+        family = colors.font_family or "monospace"
+        size = colors.font_size
+
+        def swatches(row: list) -> str:
+            return "".join(
+                f'<span style="color:{rgb_to_hex(c)}">&#9608;&#9608; </span>' for c in row
+            )
+
+        green = rgb_to_hex(colors.normal[2])
+        blue = rgb_to_hex(colors.normal[4])
+        bright_blue = rgb_to_hex(colors.bright[4])
+        html = (
+            f'<div style="background-color:{bg}; color:{fg}; padding:10px; '
+            f'font-family:\'{family}\'; font-size:{size:g}pt; border-radius:6px;">'
+            f'<div><span style="color:{green}">user@host</span>'
+            f'<span style="color:{fg}">:</span>'
+            f'<span style="color:{blue}">~/projects</span>'
+            f'<span style="color:{cursor}">$</span> ls --color<br>'
+            f'{swatches(colors.normal)}<br>{swatches(colors.bright)}</div>'
+            f'<div style="color:{fg}">The quick brown fox — normal text</div>'
+            f'<div style="color:{bright_blue}"><b>Bold / bright accent line</b></div>'
+            f'</div>'
+        )
+        self._term_preview.setHtml(html)
+
+    def _term_apply_clicked(self) -> None:
+        pal = self._require_palette()
+        if pal is None:
+            return
+        settings = self._term_settings_from_fields()
+        save_terminal_settings(settings)
+        backend = terminal_backends.TERMINALS.get(settings.terminal_id)
+        if backend is not None and settings.terminal_id != "konsole" and not backend.is_installed():
+            QMessageBox.warning(
+                self,
+                "Terminal",
+                f"{backend.label} is not installed.",
+            )
+            return
+        ok, msg = terminal_backends.apply_terminal_theme(pal, settings)
+        self._append_log(f"Terminal apply: {msg}")
+        if ok:
+            QMessageBox.information(self, "Terminal", f"Applied.\n{msg}")
+        else:
+            QMessageBox.warning(self, "Terminal", f"Apply reported a problem:\n{msg}")
+
+    def _term_save_clicked(self) -> None:
+        settings = self._term_settings_from_fields()
+        path = save_terminal_settings(settings)
+        self._append_log(f"Terminal settings saved to {path}")
+        QMessageBox.information(self, "Terminal", f"Settings saved to:\n{path}")
+
+    def _term_reset_clicked(self) -> None:
+        self._term_load_into_fields(TerminalSettings())
 
     # --- Conky tab -----------------------------------------------------
     def _build_conky_tab(self) -> QWidget:
@@ -1510,6 +1876,8 @@ class MainWindow(QMainWindow):
         bundled.setLayout(bundled_layout)
         root.addWidget(bundled)
 
+        root.addWidget(self._build_conky_shortcuts_group())
+
         hint = QLabel(
             "Bundled presets use <code>{{token}}</code> colors from the Colorizer tab. "
             "Verse uses ESV (Crossway terms apply). Weather uses "
@@ -1580,6 +1948,131 @@ class MainWindow(QMainWindow):
         self._load_conky_settings_into_fields()
         self._refresh_conky_status_labels()
         return wrap
+
+    def _build_conky_shortcuts_group(self) -> QGroupBox:
+        box = QGroupBox("Shortcuts widget")
+        layout = QVBoxLayout()
+
+        hint = QLabel(
+            "Rows for the bundled <b>Shortcuts</b> preset. Edit inline, then "
+            "<b>Save shortcuts</b> and restart the preset (or use "
+            "<b>Apply colors to running Conkys</b>) to see changes."
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(hint)
+
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Action", "Shortcut"])
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setMinimumHeight(180)
+        self._conky_shortcuts_table = table
+        layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add shortcut")
+        add_btn.setObjectName("secondary")
+        add_btn.clicked.connect(self._conky_shortcut_add_row)
+        remove_btn = QPushButton("Remove selected")
+        remove_btn.setObjectName("secondary")
+        remove_btn.clicked.connect(self._conky_shortcut_remove_selected)
+        up_btn = QPushButton("Move up")
+        up_btn.setObjectName("secondary")
+        up_btn.clicked.connect(lambda: self._conky_shortcut_move(-1))
+        down_btn = QPushButton("Move down")
+        down_btn.setObjectName("secondary")
+        down_btn.clicked.connect(lambda: self._conky_shortcut_move(1))
+        reset_btn = QPushButton("Reset to defaults")
+        reset_btn.setObjectName("secondary")
+        reset_btn.clicked.connect(self._conky_shortcut_reset_defaults)
+        for b in (add_btn, remove_btn, up_btn, down_btn, reset_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        save_row = QHBoxLayout()
+        save_btn = QPushButton("Save shortcuts")
+        save_btn.setObjectName("secondary")
+        save_btn.clicked.connect(self._conky_shortcuts_save_clicked)
+        save_row.addWidget(save_btn)
+        save_row.addStretch(1)
+        layout.addLayout(save_row)
+
+        box.setLayout(layout)
+        return box
+
+    def _shortcuts_into_table(self, shortcuts: list[ConkyShortcut]) -> None:
+        table = self._conky_shortcuts_table
+        table.setRowCount(0)
+        for sc in shortcuts:
+            self._conky_shortcut_append(sc.label, sc.keys)
+
+    def _conky_shortcut_append(self, label: str, keys: str) -> None:
+        table = self._conky_shortcuts_table
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(label))
+        table.setItem(row, 1, QTableWidgetItem(keys))
+
+    def _conky_shortcut_add_row(self) -> None:
+        self._conky_shortcut_append("", "")
+        table = self._conky_shortcuts_table
+        last = table.rowCount() - 1
+        table.setCurrentCell(last, 0)
+        table.editItem(table.item(last, 0))
+
+    def _conky_shortcut_remove_selected(self) -> None:
+        table = self._conky_shortcuts_table
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+
+    def _conky_shortcut_move(self, delta: int) -> None:
+        table = self._conky_shortcuts_table
+        row = table.currentRow()
+        target = row + delta
+        if row < 0 or target < 0 or target >= table.rowCount():
+            return
+        rows = self._shortcuts_from_table()
+        rows[row], rows[target] = rows[target], rows[row]
+        self._shortcuts_into_table(rows)
+        table.setCurrentCell(target, 0)
+
+    def _conky_shortcut_reset_defaults(self) -> None:
+        self._shortcuts_into_table(default_conky_shortcuts())
+
+    def _shortcuts_from_table(self) -> list[ConkyShortcut]:
+        table = self._conky_shortcuts_table
+        out: list[ConkyShortcut] = []
+        for row in range(table.rowCount()):
+            label_item = table.item(row, 0)
+            keys_item = table.item(row, 1)
+            label = (label_item.text() if label_item else "").strip()
+            keys = (keys_item.text() if keys_item else "").strip()
+            if not label and not keys:
+                continue
+            out.append(ConkyShortcut(label=label, keys=keys))
+        return out
+
+    def _conky_shortcuts_save_clicked(self) -> None:
+        settings = load_conky_settings()
+        settings.conky_shortcuts = self._shortcuts_from_table()
+        path = save_conky_settings(settings)
+        self._shortcuts_into_table(settings.conky_shortcuts)
+        self._append_log(
+            f"Conky shortcuts saved ({len(settings.conky_shortcuts)} entries) to {path}"
+        )
+        QMessageBox.information(
+            self,
+            "Conky",
+            "Shortcuts saved. Restart the Shortcuts preset (or Apply colors to "
+            "running Conkys) to refresh the widget.",
+        )
 
     def _parse_lat_lon_field(self, text: str) -> tuple[float | None, float | None]:
         t = text.strip()
@@ -1760,6 +2253,7 @@ class MainWindow(QMainWindow):
         self._conky_panel_transparency.blockSignals(False)
         self._conky_panel_transparency_label.setText(f"{transparency_pct}%")
         self._sync_conky_position_combos_from_settings()
+        self._shortcuts_into_table(s.conky_shortcuts)
         self._conky_theme_combo.blockSignals(True)
         try:
             for i in range(self._conky_theme_combo.count()):
