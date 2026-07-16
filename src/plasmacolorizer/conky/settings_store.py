@@ -68,6 +68,11 @@ class ConkySettings:
     conky_theme_id: str = "material"
     # Editable entries for the bundled "shortcuts" preset (label + key combo).
     conky_shortcuts: list[ConkyShortcut] = field(default_factory=default_conky_shortcuts)
+    # Window role for bundled presets.
+    # ``normal_below`` is the Plasma-visible default (desktop-type windows sit
+    # under plasmashell's wallpaper layer and look "dead" while still running).
+    # ``desktop`` remains available for non-Plasma setups.
+    conky_window_mode: str = "normal_below"
 
     def to_json_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -90,6 +95,7 @@ class ConkySettings:
             autostart_preset_ids=_opt_str_list(data.get("autostart_preset_ids")),
             conky_theme_id=_opt_theme_id(data.get("conky_theme_id")),
             conky_shortcuts=_opt_shortcuts(data.get("conky_shortcuts")),
+            conky_window_mode=_opt_window_mode(data.get("conky_window_mode")),
         )
 
 
@@ -162,6 +168,16 @@ def _opt_shortcuts(v: Any) -> list[ConkyShortcut]:
         if sc is not None:
             out.append(sc)
     return out
+
+
+def _opt_window_mode(v: Any) -> str:
+    s = str(v or "normal_below").strip().lower()
+    # Older builds defaulted to ``desktop``, which is invisible under Plasma's
+    # wallpaper layer — migrate that default to the visible Plasma-safe mode.
+    if s == "desktop":
+        # Keep explicit user choice of desktop; only bare/missing handled above.
+        return "desktop"
+    return s if s in ("desktop", "normal_below") else "normal_below"
 
 
 def _opt_theme_id(v: Any) -> str:

@@ -47,11 +47,12 @@ def test_render_preset_substitutes_hex(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert "own_window_colour =" in body
     assert "0f0f14" in body  # pure surface color (transparency comes from ARGB alpha)
     assert "own_window_argb_visual = true" in body
-    # Use ``normal`` window type so KWin tracks damage events and repaints
-    # cleanly under window overlap; the ``below`` hint keeps it stacked under
-    # all real application windows.
+    # Use ``normal`` + ``below`` by default so panels stay visible on Plasma Wayland
+    # (``desktop``-type windows sit under plasmashell's wallpaper surface).
     assert "own_window_type = 'normal'" in body
-    assert "below" in body  # comes from own_window_hints
+    assert "below" in body
+    assert "out_to_x = true" in body
+    assert "out_to_wayland = false" in body
     # Default opacity 0.75 → alpha = 191. Slider position is (1 - opacity).
     assert "own_window_argb_value = 191" in body
     assert "own_window_class = 'PlasmaColorizerConky'" in body

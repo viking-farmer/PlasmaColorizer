@@ -1633,7 +1633,26 @@ def restart_plasmashell(*, quit_timeout_s: float = 25.0) -> tuple[bool, str]:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    return True, f"{parts}; started plasmashell via {kstart}."
+    # Verify the shell actually came back — a silent failure left the desktop
+    # dead while callers assumed the restart succeeded.
+    deadline = time.monotonic() + min(12.0, max(4.0, quit_timeout_s * 0.4))
+    while time.monotonic() < deadline:
+        try:
+            check = subprocess.run(
+                ["pgrep", "-x", "plasmashell"],
+                check=False,
+                capture_output=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            break
+        if check.returncode == 0:
+            return True, f"{parts}; started plasmashell via {kstart}."
+        time.sleep(0.25)
+    return False, (
+        f"{parts}; kstart launched but plasmashell did not reappear — "
+        "run: kstart plasmashell   or: python -m plasmacolorizer.conky.recover"
+    )
 
 
 def apply_scheme() -> Path:

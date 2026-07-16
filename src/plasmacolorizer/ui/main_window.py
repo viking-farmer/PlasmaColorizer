@@ -1781,6 +1781,21 @@ class MainWindow(QMainWindow):
         )
         self._conky_theme_combo.currentIndexChanged.connect(self._on_conky_theme_changed)
 
+        self._conky_window_mode = QComboBox()
+        self._conky_window_mode.addItem(
+            "Normal + below (visible on Plasma — recommended)", "normal_below"
+        )
+        self._conky_window_mode.addItem(
+            "Desktop layer (often invisible under Plasma wallpaper)", "desktop"
+        )
+        self._conky_window_mode.setToolTip(
+            "How bundled Conky windows attach to Plasma.\n\n"
+            "Normal + below: visible above the wallpaper, under other windows. "
+            "Recommended on Plasma Wayland.\n\n"
+            "Desktop layer: sits under plasmashell's wallpaper surface — Conky "
+            "keeps running but the panel looks like it died. Avoid on Plasma."
+        )
+
         self._conky_panel_transparency = QSlider(Qt.Orientation.Horizontal)
         self._conky_panel_transparency.setRange(0, 100)
         self._conky_panel_transparency.setValue(25)
@@ -1810,6 +1825,7 @@ class MainWindow(QMainWindow):
         settings_form.addRow("Conky theme", self._conky_theme_combo)
         settings_form.addRow('System preset: CPU / RAM', self._conky_system_stats_style)
         settings_form.addRow("Bundled panel transparency", transparency_row)
+        settings_form.addRow("Panel window mode", self._conky_window_mode)
         bundled_layout.addLayout(settings_form)
 
         save_row = QHBoxLayout()
@@ -1857,8 +1873,17 @@ class MainWindow(QMainWindow):
         stop_all = QPushButton("Stop all presets")
         stop_all.setObjectName("secondary")
         stop_all.clicked.connect(self._conky_stop_all_clicked)
+        recover_btn = QPushButton("Recover Plasma desktop")
+        recover_btn.setObjectName("secondary")
+        recover_btn.setToolTip(
+            "Emergency: stop all Conky panels, disable Conky login autostart, "
+            "stop the wallpaper daemon, and restart plasmashell if it is missing. "
+            "Does not change colour schemes."
+        )
+        recover_btn.clicked.connect(self._conky_recover_desktop_clicked)
         apply_row.addWidget(apply_colors)
         apply_row.addWidget(stop_all)
+        apply_row.addWidget(recover_btn)
         apply_row.addStretch(1)
         bundled_layout.addLayout(apply_row)
 
@@ -1947,6 +1972,10 @@ class MainWindow(QMainWindow):
 
         self._load_conky_settings_into_fields()
         self._refresh_conky_status_labels()
+        self._conky_status_timer = QTimer(self)
+        self._conky_status_timer.setInterval(2500)
+        self._conky_status_timer.timeout.connect(self._refresh_conky_status_labels)
+        self._conky_status_timer.start()
         return wrap
 
     def _build_conky_shortcuts_group(self) -> QGroupBox:
@@ -2262,6 +2291,10 @@ class MainWindow(QMainWindow):
                     break
         finally:
             self._conky_theme_combo.blockSignals(False)
+        for i in range(self._conky_window_mode.count()):
+            if self._conky_window_mode.itemData(i) == s.conky_window_mode:
+                self._conky_window_mode.setCurrentIndex(i)
+                break
         self._refresh_system_style_lock()
         self._conky_autostart_check.blockSignals(True)
         self._conky_autostart_check.setChecked(bool(s.autostart_enabled))
@@ -2344,6 +2377,9 @@ class MainWindow(QMainWindow):
         settings.conky_theme_id = str(
             self._conky_theme_combo.currentData() or conky_themes.DEFAULT_THEME_ID
         )
+        settings.conky_window_mode = str(
+            self._conky_window_mode.currentData() or "desktop"
+        )
         settings.conky_preset_positions = {
             pid: str(
                 self._conky_position_combos[pid].currentData()
@@ -2384,6 +2420,33 @@ class MainWindow(QMainWindow):
         self._append_log("Conky: stopped all bundled presets.")
         self._refresh_conky_status_labels()
         self._persist_autostart_running()
+
+    def _conky_recover_desktop_clicked(self) -> None:
+        from plasmacolorizer.conky.recover import recover_desktop
+
+        reply = QMessageBox.question(
+            self,
+            "Recover Plasma desktop",
+            "Stop all Conky panels, disable Conky login autostart, stop the "
+            "wallpaper daemon, and restart plasmashell if it is missing?\n\n"
+            "Colour schemes are not changed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        notes = recover_desktop()
+        for line in notes:
+            self._append_log(f"Recover: {line}")
+        self._refresh_conky_status_labels()
+        self._conky_autostart_check.blockSignals(True)
+        self._conky_autostart_check.setChecked(False)
+        self._conky_autostart_check.blockSignals(False)
+        QMessageBox.information(
+            self,
+            "Recover Plasma desktop",
+            "Recovery finished:\n\n" + "\n".join(notes),
+        )
 
     def _conky_apply_colors_clicked(self) -> None:
         pal = self._require_palette()

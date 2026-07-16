@@ -1,11 +1,11 @@
 -- PlasmaColorizer preset: ESV Bible text (Crossway API; non-commercial use per API terms)
 -- Set API key in PlasmaColorizer Conky settings. Refreshes periodically.
--- Uses ``normal`` window type pinned ``below`` everything else: KWin then tracks
--- damage/expose events properly so translucent ARGB panels repaint cleanly when
--- other windows overlap (no more blur/contrast ghosting on the desktop layer).
+-- Uses ``desktop`` window type (safer under Plasma Wayland / XWayland).
 -- ARGB alpha is driven by the transparency slider (0 = fully transparent, 255 = solid).
 
 conky.config = {
+    out_to_wayland = false,
+    out_to_x = true,
     alignment = '{{conky_alignment}}',
     gap_x = 24,
     gap_y = 64,
@@ -13,12 +13,12 @@ conky.config = {
     -- Default text_buffer_size silently truncates long ``execi`` output (~256 B).
     text_buffer_size = 2048,
     own_window = true,
-    own_window_type = 'normal',
+    own_window_type = '{{conky_window_type}}',
     own_window_transparent = false,
     own_window_colour = '{{panel_bg_hex6}}',
     own_window_argb_visual = true,
     own_window_argb_value = {{conky_window_alpha}},
-    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+    own_window_hints = '{{conky_window_hints}}',
     own_window_class = 'PlasmaColorizerConky',
     own_window_title = 'PlasmaColorizer_verse',
     double_buffer = true,

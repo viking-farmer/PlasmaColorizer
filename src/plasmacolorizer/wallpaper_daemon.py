@@ -166,13 +166,15 @@ def run_loop(app: AppSettings | None = None) -> int:
         now = time.monotonic()
         if fp is None:
             null_fp_streak += 1
-            if null_fp_streak == 1 or null_fp_streak % 20 == 0:
+            # Back off while plasmashell is down so we do not spam DBus every 3s.
+            backoff = min(60.0, interval * (2 ** min((null_fp_streak - 1) // 5, 4)))
+            if null_fp_streak == 1 or null_fp_streak % 10 == 0:
                 log.warning(
                     "[daemon] cannot resolve wallpaper (DBus/plasmashell unavailable?) — "
-                    "retrying every %.0fs",
-                    interval,
+                    "retrying in %.0fs",
+                    backoff,
                 )
-            time.sleep(interval)
+            time.sleep(backoff)
             continue
         null_fp_streak = 0
 

@@ -191,6 +191,37 @@ def _shortcuts_body(settings) -> str:
     return "\n".join(lines)
 
 
+def _plasma_wayland_session() -> bool:
+    """True when running under a Plasma Wayland session (XWayland Conky typical)."""
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("WAYLAND_SOCKET")):
+        return False
+    desktop = (os.environ.get("XDG_CURRENT_DESKTOP") or "").upper()
+    session = (os.environ.get("XDG_SESSION_DESKTOP") or "").lower()
+    return "KDE" in desktop or session in ("plasma", "plasmawayland", "kde")
+
+
+def resolve_conky_window_role(settings) -> tuple[str, str]:
+    """Return ``(own_window_type, own_window_hints)`` for bundled presets.
+
+    On Plasma Wayland, ``desktop``-type windows are drawn under plasmashell's
+    wallpaper surface — Conky keeps running but is invisible (looks "dead").
+    Prefer ``normal`` + ``below`` there so panels stay visible without covering
+    real windows.
+    """
+    mode = str(getattr(settings, "conky_window_mode", "normal_below") or "normal_below").strip().lower()
+    if mode == "desktop" and _plasma_wayland_session():
+        mode = "normal_below"
+    if mode == "desktop":
+        return (
+            "desktop",
+            "undecorated,sticky,skip_taskbar,skip_pager",
+        )
+    return (
+        "normal",
+        "undecorated,below,sticky,skip_taskbar,skip_pager",
+    )
+
+
 def resolve_system_widget_style(settings) -> str:
     """Effective CPU/RAM widget style: theme override → user setting → ``text``."""
     theme = get_theme(getattr(settings, "conky_theme_id", None))
@@ -222,6 +253,9 @@ def build_render_context(pal: MaterialPalette, *, preset_id: str | None = None) 
     ctx["system_stats_body"] = _system_stats_body(style, pal)
     ctx["system_min_width"] = "280" if style in ("bar", "graph") else "220"
     ctx["shortcuts_body"] = _shortcuts_body(settings)
+    win_type, win_hints = resolve_conky_window_role(settings)
+    ctx["conky_window_type"] = win_type
+    ctx["conky_window_hints"] = win_hints
     if preset_id is not None and preset_id in PRESETS:
         ctx["conky_alignment"] = alignment_for_preset(preset_id)
     else:
@@ -248,6 +282,28 @@ def _pid_file(preset_id: str) -> Path:
     return conky_cache_dir() / f"{preset_id}.pid"
 
 
+def _process_is_alive(pid: int) -> bool:
+    """True if ``pid`` is a live (non-zombie) process we can signal."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # Zombies still answer kill(0); treat them as dead so the UI does not
+    # claim Conky is running after it has already exited.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            # Format: pid (comm) state ... — comm may contain spaces/parens.
+            data = fh.read()
+        rparen = data.rfind(")")
+        if rparen != -1:
+            state = data[rparen + 2 : rparen + 3]
+            if state == "Z":
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def is_preset_running(preset_id: str) -> bool:
     pf = _pid_file(preset_id)
     if not pf.is_file():
@@ -257,9 +313,7 @@ def is_preset_running(preset_id: str) -> bool:
     except ValueError:
         pf.unlink(missing_ok=True)
         return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not _process_is_alive(pid):
         pf.unlink(missing_ok=True)
         return False
     return True
@@ -275,6 +329,9 @@ def stop_preset(preset_id: str) -> tuple[bool, str]:
     except ValueError:
         pf.unlink(missing_ok=True)
         return True, "stale pid"
+    if not _process_is_alive(pid):
+        pf.unlink(missing_ok=True)
+        return True, "already exited"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -358,16 +415,47 @@ def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
         return False, "conky executable not found in PATH"
     if is_preset_running(preset_id):
         stop_preset(preset_id)
+    log_path = conky_cache_dir() / f"{preset_id}.stderr.log"
+    conky_cache_dir().mkdir(parents=True, exist_ok=True)
+    try:
+        log_fh = log_path.open("w", encoding="utf-8")
+    except OSError:
+        log_fh = subprocess.DEVNULL
     try:
         proc = subprocess.Popen(
             [bin_path, "-c", str(cfg)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=log_fh,
             start_new_session=True,
         )
     except OSError as exc:
+        if log_fh is not subprocess.DEVNULL:
+            log_fh.close()
         return False, str(exc)
+    if log_fh is not subprocess.DEVNULL:
+        log_fh.close()
+
+    # Brief settle: if Conky exits immediately (bad config / display), fail
+    # loudly instead of leaving a zombie PID that looks "running".
+    time.sleep(0.35)
+    rc = proc.poll()
+    if rc is not None:
+        # Reap so we do not leave zombies when we are still the parent.
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        tail = ""
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace").strip()[-400:]
+        except OSError:
+            pass
+        detail = f" (exit {rc})"
+        if tail:
+            detail += f": {tail}"
+        return False, f"conky exited immediately{detail}"
+
     _pid_file(preset_id).write_text(str(proc.pid), encoding="utf-8")
     # Conky's own ARGB visual is unreliable under XWayland/KWin, so push the
     # universal _NET_WM_WINDOW_OPACITY hint as soon as the window is mapped.
