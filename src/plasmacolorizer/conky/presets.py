@@ -304,6 +304,17 @@ def _process_is_alive(pid: int) -> bool:
     return True
 
 
+def _pid_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _pid_is_conky(pid: int) -> bool:
+    return _pid_comm(pid) == "conky"
+
+
 def is_preset_running(preset_id: str) -> bool:
     pf = _pid_file(preset_id)
     if not pf.is_file():
@@ -313,14 +324,14 @@ def is_preset_running(preset_id: str) -> bool:
     except ValueError:
         pf.unlink(missing_ok=True)
         return False
-    if not _process_is_alive(pid):
+    if not _process_is_alive(pid) or not _pid_is_conky(pid):
         pf.unlink(missing_ok=True)
         return False
     return True
 
 
 def stop_preset(preset_id: str) -> tuple[bool, str]:
-    """SIGTERM the Conky instance we started for this preset."""
+    """SIGTERM (then SIGKILL) the Conky instance we started for this preset."""
     pf = _pid_file(preset_id)
     if not pf.is_file():
         return True, "not running"
@@ -332,6 +343,9 @@ def stop_preset(preset_id: str) -> tuple[bool, str]:
     if not _process_is_alive(pid):
         pf.unlink(missing_ok=True)
         return True, "already exited"
+    if not _pid_is_conky(pid):
+        pf.unlink(missing_ok=True)
+        return True, f"stale pid {pid} (not conky)"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -339,7 +353,24 @@ def stop_preset(preset_id: str) -> tuple[bool, str]:
         return True, "already exited"
     except PermissionError as exc:
         return False, str(exc)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _process_is_alive(pid):
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and _process_is_alive(pid):
+            time.sleep(0.05)
+
     pf.unlink(missing_ok=True)
+    if _process_is_alive(pid):
+        return False, f"failed to stop pid {pid}"
     return True, f"stopped pid {pid}"
 
 
@@ -408,6 +439,32 @@ def apply_panel_opacity_to_running(opacity: float | None = None) -> None:
             _apply_window_opacity(meta.window_title, opacity)
 
 
+def _kill_conky_for_config(cfg: Path) -> None:
+    """SIGTERM any ``conky -c <cfg>`` processes (clears duplicate login/UI spawns)."""
+    target = str(cfg)
+    try:
+        out = subprocess.run(
+            ["pgrep", "-a", "-x", "conky"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    for line in (out.stdout or "").splitlines():
+        if target not in line:
+            continue
+        try:
+            pid = int(line.split(None, 1)[0])
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+
 def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
     """Spawn a Conky process for ``cfg`` and record its pid (no ``-d`` so PID stays valid)."""
     bin_path = conky_binary()
@@ -415,6 +472,9 @@ def _spawn_conky(preset_id: str, cfg: Path) -> tuple[bool, str]:
         return False, "conky executable not found in PATH"
     if is_preset_running(preset_id):
         stop_preset(preset_id)
+    # Autostart + UI refresh can leave two Conkys on the same config; clear them.
+    _kill_conky_for_config(cfg)
+    time.sleep(0.15)
     log_path = conky_cache_dir() / f"{preset_id}.stderr.log"
     conky_cache_dir().mkdir(parents=True, exist_ok=True)
     try:

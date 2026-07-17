@@ -205,6 +205,7 @@ def run_loop(app: AppSettings | None = None) -> int:
                 result = generate_and_apply_from_wallpaper(
                     app_settings=settings,
                     log_prefix="[daemon]",
+                    allow_plasmashell_restart=False,
                 )
                 if not result.disk.apply_ok:
                     log.warning("[daemon] apply failed: %s", result.disk.apply_error)

@@ -159,10 +159,34 @@ def test_apply_plasma_panel_opacity_live_restarts_when_script_fails(
     cfg = tmp_path / ".config"
     cfg.mkdir(parents=True)
     (cfg / "plasmashellrc").write_text("[PlasmaViews][Panel 1]\n", encoding="utf-8")
-    ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(PanelOpacityMode.OPAQUE)
+    ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(
+        PanelOpacityMode.OPAQUE, allow_restart=True, allow_script=True,
+    )
     assert ok is True
     assert "restarted" in msg
     mock_restart.assert_called_once()
+    assert read_plasma_panel_opacity_mode() == PanelOpacityMode.OPAQUE
+
+
+@patch("plasmacolorizer.core.plasma_scheme.apply_panel_opacity_via_script", return_value=(False, "no dbus"))
+@patch("plasmacolorizer.core.plasma_scheme.restart_plasmashell", return_value=(True, "restarted"))
+@patch("plasmacolorizer.core.plasma_scheme._patch_desktop_theme_adaptive_transparency", return_value=(True, "adaptive OK"))
+def test_apply_plasma_panel_opacity_live_skips_restart_by_default(
+    _patch_adaptive: MagicMock,
+    mock_restart: MagicMock,
+    _script: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Safe mode: never auto-restart plasmashell from the opacity combo."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".config"
+    cfg.mkdir(parents=True)
+    (cfg / "plasmashellrc").write_text("[PlasmaViews][Panel 1]\n", encoding="utf-8")
+    ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(PanelOpacityMode.OPAQUE)
+    assert ok is True
+    assert "safe mode" in msg
+    mock_restart.assert_not_called()
     assert read_plasma_panel_opacity_mode() == PanelOpacityMode.OPAQUE
 
 
@@ -182,7 +206,9 @@ def test_apply_plasma_panel_opacity_live_skips_restart_when_script_works(
     cfg = tmp_path / ".config"
     cfg.mkdir(parents=True)
     (cfg / "plasmashellrc").write_text("[PlasmaViews][Panel 1]\n", encoding="utf-8")
-    ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(PanelOpacityMode.OPAQUE)
+    ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(
+        PanelOpacityMode.OPAQUE, allow_script=True,
+    )
     assert ok is True
     assert "no restart needed" in msg
     mock_restart.assert_not_called()
@@ -274,9 +300,11 @@ def test_apply_plasma_desktop_theme_live_invokes_cli(mock_run: MagicMock) -> Non
 
 
 @patch("plasmacolorizer.core.plasma_scheme.apply_plasma_desktop_theme_live", return_value=(True, "live OK"))
+@patch("plasmacolorizer.core.plasma_scheme.apply_plasma_colorscheme_live", return_value=(True, "cs OK"))
 @patch("plasmacolorizer.core.plasma_scheme.shutil.which", return_value="/usr/bin/kquitapp6")
-def test_notify_kde_calls_desktop_theme_live_first(
+def test_notify_kde_safe_mode_skips_desktop_theme_and_refresh(
     _which: MagicMock,
+    mock_cs: MagicMock,
     mock_live: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,9 +319,41 @@ def test_notify_kde_calls_desktop_theme_live_first(
         "dbus",
         MagicMock(SessionBus=lambda: _FakeBus()),
     )
+    monkeypatch.setattr(plasma_scheme, "plasmashell_dbus_ready", lambda: False)
+    monkeypatch.setattr(plasma_scheme, "plasmashell_process_running", lambda: True)
     ok, msg = notify_kde_palette_change(pal)
+    mock_cs.assert_called_once()
+    mock_live.assert_not_called()
+    assert ok is True
+    assert "desktoptheme skipped" in msg
+    assert "refreshCurrentShell skipped" in msg
+
+
+@patch("plasmacolorizer.core.plasma_scheme.apply_plasma_desktop_theme_live", return_value=(True, "live OK"))
+@patch("plasmacolorizer.core.plasma_scheme.apply_plasma_colorscheme_live", return_value=(True, "cs OK"))
+def test_notify_kde_aggressive_calls_desktop_theme(
+    mock_cs: MagicMock,
+    mock_live: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pal = _minimal_palette()
+
+    class _FakeBus:
+        def get_object(self, *_a, **_k):
+            raise OSError("no dbus in test")
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "dbus",
+        MagicMock(SessionBus=lambda: _FakeBus()),
+    )
+    monkeypatch.setattr(plasma_scheme, "plasmashell_dbus_ready", lambda: False)
+    monkeypatch.setattr(plasma_scheme, "plasmashell_process_running", lambda: True)
+    ok, msg = notify_kde_palette_change(pal, aggressive_shell_refresh=True)
+    mock_cs.assert_called_once()
     mock_live.assert_called_once()
     assert ok is True
+    assert "live OK" in msg
 
 
 def test_theme_plasmarc_has_breaking_sections(
@@ -364,7 +424,7 @@ def test_collect_apply_diagnostics_includes_panel_opacity_failures(
 @patch("plasmacolorizer.core.plasma_scheme.apply_plasma_desktop_theme_live", return_value=(True, "reloaded"))
 def test_repair_plasma_theme_for_panel_opacity(
     _live: MagicMock,
-    _restart: MagicMock,
+    mock_restart: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -377,6 +437,12 @@ def test_repair_plasma_theme_for_panel_opacity(
     )
     ok, msg = plasma_scheme.repair_plasma_theme_for_panel_opacity()
     assert ok is True
-    assert "restarted" in msg
+    assert "safe mode" in msg
+    mock_restart.assert_not_called()
     result = (theme_dir / "plasmarc").read_text(encoding="utf-8")
     assert "[AdaptiveTransparency]" not in result
+
+    ok2, msg2 = plasma_scheme.repair_plasma_theme_for_panel_opacity(allow_restart=True)
+    assert ok2 is True
+    assert "restarted" in msg2
+    mock_restart.assert_called_once()

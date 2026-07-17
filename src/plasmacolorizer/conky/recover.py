@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import time
+from pathlib import Path
 
 from plasmacolorizer.conky import presets as conky_presets
 
@@ -108,22 +109,35 @@ def stop_wallpaper_daemon() -> str:
 
 
 def plasmashell_running() -> bool:
-    try:
-        r = subprocess.run(
-            ["pgrep", "-x", "plasmashell"],
-            check=False,
-            capture_output=True,
-            timeout=3,
-        )
-        return r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    from plasmacolorizer.core.plasma_scheme import plasmashell_process_running
+
+    return plasmashell_process_running()
 
 
 def ensure_plasmashell(*, wait_s: float = 8.0) -> tuple[bool, str]:
-    """Start plasmashell if missing; wait briefly for it to come up."""
-    if plasmashell_running():
+    """Start plasmashell if missing; prefer the systemd user unit."""
+    from plasmacolorizer.core.plasma_scheme import (
+        _wait_for_plasmashell,
+        plasmashell_dbus_ready,
+        plasmashell_process_running,
+    )
+
+    if plasmashell_process_running() and plasmashell_dbus_ready():
         return True, "plasmashell already running"
+
+    systemctl = shutil.which("systemctl")
+    if systemctl:
+        try:
+            subprocess.run(
+                [systemctl, "--user", "start", "plasma-plasmashell.service"],
+                check=False,
+                capture_output=True,
+                timeout=max(8.0, wait_s),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"systemctl start plasma-plasmashell failed: {exc}"
+        if _wait_for_plasmashell(timeout_s=wait_s):
+            return True, "started plasma-plasmashell.service via systemctl"
 
     kstart = shutil.which("kstart")
     shell = shutil.which("plasmashell")
@@ -132,7 +146,7 @@ def ensure_plasmashell(*, wait_s: float = 8.0) -> tuple[bool, str]:
     elif shell:
         cmd = [shell]
     else:
-        return False, "neither kstart nor plasmashell found in PATH"
+        return False, "neither systemctl unit nor kstart/plasmashell available"
 
     try:
         subprocess.Popen(
@@ -144,14 +158,11 @@ def ensure_plasmashell(*, wait_s: float = 8.0) -> tuple[bool, str]:
     except OSError as exc:
         return False, f"failed to start plasmashell: {exc}"
 
-    deadline = time.monotonic() + max(1.0, wait_s)
-    while time.monotonic() < deadline:
-        if plasmashell_running():
-            return True, f"started plasmashell via {cmd[0]}"
-        time.sleep(0.25)
+    if _wait_for_plasmashell(timeout_s=wait_s):
+        return True, f"started plasmashell via {cmd[0]}"
     return False, (
-        f"launched {cmd[0]} but plasmashell did not appear within {wait_s:.0f}s — "
-        "try logging out/in, or run: kstart plasmashell"
+        f"launched {cmd[0]} but plasmashell DBus did not become ready — "
+        "try: systemctl --user start plasma-plasmashell.service"
     )
 
 
@@ -166,6 +177,28 @@ def recover_desktop(
     notes.extend(stop_all_conky(aggressive=True))
     if disable_autostart:
         notes.append(disable_conky_autostart())
+        # Also disarm the wallpaper daemon autostart — it used to kquit plasmashell.
+        daemon_desktop = Path.home() / ".config/autostart/plasmacolorizer-daemon.desktop"
+        disabled = daemon_desktop.with_suffix(daemon_desktop.suffix + ".disabled")
+        if daemon_desktop.is_file():
+            try:
+                os.replace(daemon_desktop, disabled)
+                notes.append(f"disabled wallpaper daemon autostart → {disabled}")
+            except OSError as exc:
+                notes.append(f"could not disable daemon autostart: {exc}")
+        try:
+            from plasmacolorizer.core.app_settings import load_app_settings, save_app_settings
+
+            app = load_app_settings()
+            if app.wallpaper_daemon_enabled or app.restart_plasma_after_apply:
+                app.wallpaper_daemon_enabled = False
+                app.restart_plasma_after_apply = False
+                save_app_settings(app)
+                notes.append(
+                    "settings: wallpaper_daemon_enabled=False, restart_plasma_after_apply=False"
+                )
+        except OSError as exc:
+            notes.append(f"could not update app settings: {exc}")
     if stop_daemon:
         notes.append(stop_wallpaper_daemon())
     if start_shell:

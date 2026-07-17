@@ -28,7 +28,8 @@ class AppSettings:
     # Re-run generate+apply when the Plasma wallpaper changes (while app is open).
     auto_apply_on_wallpaper_change: bool = True
     # Background login daemon that watches wallpaper even when the UI is closed.
-    wallpaper_daemon_enabled: bool = True
+    # Default off: soft-apply churn at login has destabilized plasmashell.
+    wallpaper_daemon_enabled: bool = False
     wallpaper_daemon_poll_interval_s: float = 3.0
     wallpaper_monitor: int = 0
     # Persisted Colorizer tab generation options (used by daemon + next UI session).
@@ -38,7 +39,10 @@ class AppSettings:
     scheme_accent: str = "primary"
     scheme_emphasis: str = "secondary"
     scheme_links: str = ""
-    restart_plasma_after_apply: bool = True
+    # Full plasmashell restart after apply (UI only). Default off: soft DBus /
+    # plasma-apply-* refresh is safer; kquitapp has left the desktop dead when
+    # systemd's plasma-plasmashell.service (--no-respawn) did not come back.
+    restart_plasma_after_apply: bool = False
     # Fingerprint of the wallpaper image last written to disk (daemon sync).
     last_applied_wallpaper_fingerprint: str = ""
 
@@ -71,7 +75,7 @@ class AppSettings:
                 data.get("auto_apply_on_wallpaper_change"), default=True,
             ),
             wallpaper_daemon_enabled=_opt_bool(
-                data.get("wallpaper_daemon_enabled"), default=True,
+                data.get("wallpaper_daemon_enabled"), default=False,
             ),
             wallpaper_daemon_poll_interval_s=_opt_positive_float(
                 data.get("wallpaper_daemon_poll_interval_s"), default=3.0,
@@ -88,7 +92,7 @@ class AppSettings:
             scheme_emphasis=_opt_str(data.get("scheme_emphasis"), default="secondary"),
             scheme_links=_opt_str(data.get("scheme_links"), default=""),
             restart_plasma_after_apply=_opt_bool(
-                data.get("restart_plasma_after_apply"), default=True,
+                data.get("restart_plasma_after_apply"), default=False,
             ),
             last_applied_wallpaper_fingerprint=str(
                 data.get("last_applied_wallpaper_fingerprint") or "",

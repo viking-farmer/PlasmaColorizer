@@ -86,8 +86,14 @@ def generate_and_apply_from_wallpaper(
     src_path: str | None = None,
     app_settings: AppSettings | None = None,
     log_prefix: str = "",
+    allow_plasmashell_restart: bool = True,
 ) -> PipelineResult:
-    """Quantize wallpaper, write scheme files, and refresh the live KDE session."""
+    """Quantize wallpaper, write scheme files, and refresh the live KDE session.
+
+    ``allow_plasmashell_restart`` must be False for the wallpaper daemon: quitting
+    plasmashell from a background process (``kquitapp`` / unit restart) has left
+    the desktop dead when the shell did not come back under systemd.
+    """
     log = get_logger()
     app = app_settings or load_app_settings()
     prefix = f"{log_prefix} " if log_prefix else ""
@@ -122,8 +128,12 @@ def generate_and_apply_from_wallpaper(
         )
         restarted = False
         restart_msg = ""
-        if app.restart_plasma_after_apply or app.plasma_panel_opacity_mode != "opaque":
+        # Soft DBus / plasma-apply-* refresh is enough for wallpaper auto-apply.
+        # A full plasmashell restart is UI-opt-in only (and never from the daemon).
+        if allow_plasmashell_restart and app.restart_plasma_after_apply:
             restarted, restart_msg = plasma_scheme.restart_plasmashell()
+        elif not allow_plasmashell_restart and app.restart_plasma_after_apply:
+            restart_msg = "plasmashell restart skipped (daemon soft-apply only)"
 
         record_applied_wallpaper_fingerprint(src)
 

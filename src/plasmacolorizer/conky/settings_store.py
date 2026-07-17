@@ -61,7 +61,8 @@ class ConkySettings:
     # preset_id → Conky ``alignment`` (3×3 grid). Missing keys use bundled defaults.
     conky_preset_positions: dict[str, str] = field(default_factory=dict)
     # Install ~/.config/autostart/plasmacolorizer-conky.desktop and respawn last-running presets at login.
-    autostart_enabled: bool = True
+    # Default off: multi-Conky ARGB panels at login have stressed plasmashell on Plasma Wayland.
+    autostart_enabled: bool = False
     # Preset ids that were running last time (updated whenever you Start/Stop a bundled preset).
     autostart_preset_ids: list[str] = field(default_factory=list)
     # Visual theme id (see ``plasmacolorizer.conky.themes.THEMES``); colors stay palette-driven.
@@ -91,7 +92,7 @@ class ConkySettings:
             system_stats_style=_opt_system_stats_style(data.get("system_stats_style")),
             conky_panel_opacity=_opt_opacity(data.get("conky_panel_opacity")),
             conky_preset_positions=_opt_preset_positions(data.get("conky_preset_positions")),
-            autostart_enabled=_opt_bool_with_default(data.get("autostart_enabled"), default=True),
+            autostart_enabled=_opt_bool_with_default(data.get("autostart_enabled"), default=False),
             autostart_preset_ids=_opt_str_list(data.get("autostart_preset_ids")),
             conky_theme_id=_opt_theme_id(data.get("conky_theme_id")),
             conky_shortcuts=_opt_shortcuts(data.get("conky_shortcuts")),

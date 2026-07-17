@@ -121,6 +121,17 @@ class MainWindow(QMainWindow):
         self._pending_wallpaper_path: str | None = None
         self._suppress_apply_dialogs = False
 
+        # Timers must exist before building tabs: loading app settings toggles the
+        # wallpaper-daemon checkbox, which used to call into these before init.
+        self._wallpaper_debounce_timer = QTimer(self)
+        self._wallpaper_debounce_timer.setSingleShot(True)
+        self._wallpaper_debounce_timer.setInterval(WALLPAPER_CHANGE_DEBOUNCE_MS)
+        self._wallpaper_debounce_timer.timeout.connect(self._on_wallpaper_change_debounced)
+
+        self._wallpaper_poll_timer = QTimer(self)
+        self._wallpaper_poll_timer.setInterval(WALLPAPER_POLL_INTERVAL_MS)
+        self._wallpaper_poll_timer.timeout.connect(self._on_wallpaper_poll_tick)
+
         tabs = QTabWidget()
         log_tab = self._build_log_tab()
         color_tab = self._build_color_tab()
@@ -148,14 +159,6 @@ class MainWindow(QMainWindow):
             )
         self._update_panel_opacity_repair_btn()
 
-        self._wallpaper_debounce_timer = QTimer(self)
-        self._wallpaper_debounce_timer.setSingleShot(True)
-        self._wallpaper_debounce_timer.setInterval(WALLPAPER_CHANGE_DEBOUNCE_MS)
-        self._wallpaper_debounce_timer.timeout.connect(self._on_wallpaper_change_debounced)
-
-        self._wallpaper_poll_timer = QTimer(self)
-        self._wallpaper_poll_timer.setInterval(WALLPAPER_POLL_INTERVAL_MS)
-        self._wallpaper_poll_timer.timeout.connect(self._on_wallpaper_poll_tick)
         self._sync_wallpaper_watchers()
         self._update_daemon_status_label()
 
@@ -370,7 +373,8 @@ class MainWindow(QMainWindow):
         self._plasma_panel_opacity_combo.setToolTip(
             "Plasma 6 panel opacity mode (not partial alpha like Conky). "
             "Solid keeps scheme colours visible on the taskbar. "
-            "Changing this restarts plasmashell briefly so the panel picks up the new mode."
+            "Translucent can make a dark panel look like it vanished. "
+            "Changes are saved without restarting plasmashell (safe mode)."
         )
         self._plasma_panel_opacity_combo.currentIndexChanged.connect(
             self._on_plasma_panel_opacity_mode_changed,
@@ -390,8 +394,8 @@ class MainWindow(QMainWindow):
         self._panel_opacity_repair_btn = QPushButton("Repair theme for panel opacity")
         self._panel_opacity_repair_btn.setObjectName("secondary")
         self._panel_opacity_repair_btn.setToolTip(
-            "Remove opacity-breaking sections from the PlasmaColorizer theme plasmarc "
-            "and restart plasmashell."
+            "Remove opacity-breaking sections from the PlasmaColorizer theme plasmarc. "
+            "Does not restart plasmashell unless you ask it to."
         )
         self._panel_opacity_repair_btn.clicked.connect(self._on_repair_panel_opacity)
         opacity_diag_row.addWidget(self._panel_opacity_diagnose_btn)
@@ -400,13 +404,12 @@ class MainWindow(QMainWindow):
         scheme_layout.addLayout(opacity_diag_row)
 
         plasma_opacity_hint = QLabel(
-            "Plasma 6 uses three discrete panel modes (Solid / Adaptive / Translucent), not a "
-            "continuous transparency slider like Conky. Translucent shows the wallpaper through "
-            "the panel; KWin blur and wallpaper contrast make the effect easier to see. "
-            "If all three modes look identical, the PlasmaColorizer theme plasmarc may need repair — "
-            "use Diagnose, then Repair. Changing the mode restarts plasmashell briefly."
+            "Prefer <b>Solid</b>. Adaptive/Translucent can make a dark Material You panel "
+            "look missing even though plasmashell is still running. "
+            "Modes are saved to plasmashellrc without auto-restarting the shell."
         )
         plasma_opacity_hint.setWordWrap(True)
+        plasma_opacity_hint.setTextFormat(Qt.TextFormat.RichText)
         scheme_layout.addWidget(plasma_opacity_hint)
 
         scheme_box.setLayout(scheme_layout)
@@ -504,14 +507,15 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
 
         self._restart_plasma = QCheckBox(
-            "Restart Plasma shell afterward (required once after first apply; brief flicker)"
+            "Restart Plasma shell afterward (optional; brief flicker — can break the desktop)"
         )
-        self._restart_plasma.setChecked(True)
+        self._restart_plasma.setChecked(False)
         self._restart_plasma.setToolTip(
-            "Plasma panel and Kickoff read colours from the active Plasma **desktop theme** "
-            "(see ~/.local/share/plasma/desktoptheme/). After generating a theme, "
-            "kquitapp6 plasmashell + kstart plasmashell reloads that cache. "
-            "Leave this checked unless you know you do not need a full shell restart."
+            "Soft apply (plasma-apply-colorscheme + DBus) is enough for most updates and is safe.\n\n"
+            "A full plasmashell restart reloads panel/Kickoff caches, but quitting the shell "
+            "via kquitapp has left Plasma dead on this machine when systemd's "
+            "plasma-plasmashell.service (--no-respawn) did not recover. "
+            "Prefer leaving this unchecked; use Recover Plasma desktop if the shell dies."
         )
         layout.addWidget(self._restart_plasma)
 
@@ -582,8 +586,8 @@ class MainWindow(QMainWindow):
             self._append_log(msg)
             if not ok:
                 self._append_log(
-                    "Repair completed with errors — check the log and try "
-                    "kquitapp6 plasmashell && kstart plasmashell manually.",
+                    "Repair completed with errors — check the log. "
+                    "If needed: systemctl --user restart plasma-plasmashell.service",
                 )
         except OSError as exc:
             self._append_log(f"Repair failed: {exc}")
@@ -604,19 +608,34 @@ class MainWindow(QMainWindow):
         self._plasma_panel_opacity_combo.blockSignals(False)
 
     def _on_plasma_panel_opacity_mode_changed(self, _index: int) -> None:
-        self._save_app_settings_from_ui()
         mode = str_to_panel_opacity_mode(self._plasma_panel_opacity_mode_from_ui())
+        mode_name = plasma_scheme.panel_opacity_mode_to_str(mode)
+        if mode_name == "translucent":
+            reply = QMessageBox.warning(
+                self,
+                "Translucent panel",
+                "Translucent mode can make a dark panel look like it disappeared "
+                "(wallpaper shows through), even though Plasma is still running.\n\n"
+                "Prefer Solid unless you specifically want see-through panels.\n\n"
+                "Continue with Translucent?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._set_plasma_panel_opacity_combo("opaque")
+                return
+        self._save_app_settings_from_ui()
         self._append_log(
-            f"Applying panel opacity → {plasma_scheme.panel_opacity_mode_to_str(mode)} "
-            f"({int(mode)})…",
+            f"Applying panel opacity → {mode_name} ({int(mode)})…",
         )
         try:
             ok, msg = plasma_scheme.apply_plasma_panel_opacity_live(mode)
             self._append_log(msg)
             if not ok:
                 self._append_log(
-                    "Panel opacity was saved to plasmashellrc but plasmashell could not restart. "
-                    "Run manually: kquitapp6 plasmashell && kstart plasmashell",
+                    "Panel opacity was saved to plasmashellrc. "
+                    "If the look did not change, run once: "
+                    "systemctl --user restart plasma-plasmashell.service",
                 )
         except OSError as exc:
             self._append_log(f"Panel opacity apply failed: {exc}")
@@ -648,8 +667,12 @@ class MainWindow(QMainWindow):
             self._component_colors_toggle.setChecked(True)
         self._apply_konsole_scheme.setChecked(app.apply_konsole_scheme)
         self._dolphin_follow_system.setChecked(app.dolphin_follow_system_colorscheme)
+        self._auto_apply_wallpaper.blockSignals(True)
         self._auto_apply_wallpaper.setChecked(app.auto_apply_on_wallpaper_change)
+        self._auto_apply_wallpaper.blockSignals(False)
+        self._wallpaper_daemon.blockSignals(True)
         self._wallpaper_daemon.setChecked(app.wallpaper_daemon_enabled)
+        self._wallpaper_daemon.blockSignals(False)
         self._monitor.setValue(app.wallpaper_monitor)
         self._quality.setValue(app.quantizer_quality)
         self._primary_bias_slider.setValue(int(round(app.primary_bias_strength * 100)))
@@ -711,6 +734,8 @@ class MainWindow(QMainWindow):
         save_app_settings(self._app_settings_from_ui())
 
     def _sync_wallpaper_watchers(self) -> None:
+        if not hasattr(self, "_wallpaper_poll_timer"):
+            return
         app = load_app_settings()
         if app.wallpaper_daemon_enabled and app.auto_apply_on_wallpaper_change:
             self._wallpaper_poll_timer.stop()
@@ -755,6 +780,9 @@ class MainWindow(QMainWindow):
 
     def _on_wallpaper_daemon_toggled(self, enabled: bool) -> None:
         self._save_app_settings_from_ui()
+        if not hasattr(self, "_wallpaper_poll_timer"):
+            self._update_daemon_status_label()
+            return
         if enabled:
             wallpaper_daemon.install_autostart()
             self._ensure_wallpaper_daemon_running()
@@ -1286,7 +1314,10 @@ class MainWindow(QMainWindow):
         app = self._app_settings_from_ui()
         for note in plasma_scheme.collect_apply_diagnostics(app):
             self._append_log(f"Note: {note}")
-        self._append_log("Reloading Plasma Style + DBus: KWin, PlasmaShell, accentColor…")
+        self._append_log(
+            "Soft-refresh: plasma-apply-colorscheme + KWin + accent "
+            "(desktoptheme / refreshCurrentShell skipped — safe mode)…"
+        )
         notify_ok, notify_msg = plasma_scheme.notify_kde_palette_change(
             result.palette,
             timeout=2.0,
@@ -1295,11 +1326,17 @@ class MainWindow(QMainWindow):
         self._append_log(notify_msg)
 
         restarted = False
-        if self._restart_plasma.isChecked() or app.plasma_panel_opacity_mode != "opaque":
+        if self._restart_plasma.isChecked():
             self._append_log("Restarting plasmashell (full panel / launcher reload)…")
             rs_ok, rs_msg = plasma_scheme.restart_plasmashell()
             self._append_log(rs_msg)
             restarted = rs_ok
+            if not rs_ok:
+                self._append_log(
+                    "WARN: plasmashell restart failed — run: "
+                    "systemctl --user start plasma-plasmashell.service"
+                    "  or: plasmacolorizer-recover"
+                )
 
         self._save_app_settings_from_ui()
         try:

@@ -672,11 +672,18 @@ def panel_opacity_diagnostics_need_repair(
 def repair_plasma_theme_for_panel_opacity(
     *,
     restart_timeout_s: float = 25.0,
+    allow_restart: bool = False,
 ) -> tuple[bool, str]:
-    """Strip opacity-breaking theme sections and restart plasmashell."""
+    """Strip opacity-breaking theme sections; optionally restart plasmashell."""
     parts: list[str] = []
     strip_ok, strip_msg = _strip_panel_opacity_breaking_sections()
     parts.append(strip_msg)
+    if not allow_restart:
+        parts.append(
+            "plasmashell restart skipped (safe mode) — "
+            "run: systemctl --user restart plasma-plasmashell.service if needed"
+        )
+        return strip_ok, "; ".join(parts)
     ok, rs_msg = restart_plasmashell(quit_timeout_s=restart_timeout_s)
     parts.append(rs_msg)
     return strip_ok and ok, "; ".join(parts)
@@ -704,10 +711,11 @@ def apply_panel_opacity_via_script(mode: PanelOpacityMode) -> tuple[bool, str]:
     reports success but the value will not change (caller should verify/restart).
     """
     name = panel_opacity_mode_to_str(mode)
+    # Return count as last expression — print() is not reliably captured by evaluateScript.
     script = (
         "var applied = 0;"
         "panels().forEach(function(p){ try { p.opacity = '%s'; applied += 1; } catch(e) {} });"
-        "print(applied);"
+        "applied;"
     ) % name
     ok, out = run_plasma_shell_script(script)
     if not ok:
@@ -718,47 +726,77 @@ def apply_panel_opacity_via_script(mode: PanelOpacityMode) -> tuple[bool, str]:
 def _panel_opacity_applied_via_script(mode: PanelOpacityMode) -> bool:
     """Return True if the live scripting API reports the desired mode on all panels."""
     want = panel_opacity_mode_to_str(mode)
+    # Last expression is returned by evaluateScript; print() alone is unreliable.
+    # Accept string names and numeric enums used on some Plasma builds.
+    mode_num = {
+        PanelOpacityMode.ADAPTIVE: "0",
+        PanelOpacityMode.OPAQUE: "1",
+        PanelOpacityMode.TRANSLUCENT: "2",
+    }.get(mode, "")
     script = (
+        "var vals = [];"
         "var ok = true;"
-        "panels().forEach(function(p){ if (p.opacity !== '%s') ok = false; });"
-        "print(ok ? 'yes' : 'no');"
-    ) % want
+        "panels().forEach(function(p){"
+        "  var v = String(p.opacity);"
+        "  vals.push(v);"
+        "  if (v !== '%s' && v.toLowerCase() !== '%s' && v !== '%s') ok = false;"
+        "});"
+        "ok ? ('yes:' + vals.join(',')) : ('no:' + vals.join(','));"
+    ) % (want, want, mode_num)
     ok, out = run_plasma_shell_script(script)
-    return ok and out.strip().endswith("yes")
+    text = (out or "").strip()
+    verified = ok and text.startswith("yes")
+    return verified
 
 
 def apply_plasma_panel_opacity_live(
     mode: PanelOpacityMode,
     *,
     restart_timeout_s: float = 25.0,
+    allow_restart: bool = False,
+    allow_script: bool = False,
 ) -> tuple[bool, str]:
     """
-    Persist panel opacity mode and make it visible.
+    Persist panel opacity mode and optionally apply it live.
 
     Strategy:
       1. Write the integer ``panelOpacity`` to ``plasmashellrc`` so the setting
          persists across logins.
-      2. Ensure the desktop theme's ``[AdaptiveTransparency]`` is disabled — when
-         enabled it overrides the per-panel opacity mode and makes all three
-         choices render identically.
-      3. Try the live Plasma scripting API (no flicker where supported).
-      4. If scripting did not take effect, restart ``plasmashell`` — ``PanelView``
-         only re-reads ``panelOpacity`` at startup, so this is the reliable path.
+      2. Ensure the desktop theme's ``[AdaptiveTransparency]`` is disabled.
+      3. Optionally try the live Plasma scripting API (``allow_script``).
+         On Plasma Wayland this often logs "plugin does not support setting
+         window opacity" and does not change panels — default is off.
+      4. Restart plasmashell **only** when ``allow_restart=True`` and live verify
+         failed. Auto-restart previously killed the desktop.
     """
     apply_plasma_panel_opacity_mode(mode)
     parts: list[str] = [
         f"plasmashellrc panelOpacity={int(mode)} ({panel_opacity_mode_to_str(mode)})",
     ]
-    # Theme-level AdaptiveTransparency overrides the per-panel opacity mode, so it
-    # must stay off for Solid / Adaptive / Translucent to have any visible effect.
     ad_ok, ad_msg = _patch_desktop_theme_adaptive_transparency(enabled=False)
     if not ad_ok:
         parts.append(ad_msg)
 
-    script_ok, script_msg = apply_panel_opacity_via_script(mode)
-    parts.append(script_msg)
-    if script_ok and _panel_opacity_applied_via_script(mode):
+    script_ok = False
+    verified = False
+    if allow_script:
+        script_ok, script_msg = apply_panel_opacity_via_script(mode)
+        parts.append(script_msg)
+        verified = script_ok and _panel_opacity_applied_via_script(mode)
+    else:
+        parts.append("live scripting skipped (safe mode)")
+
+    will_restart = (not verified) and allow_restart
+    if verified:
         parts.append("applied live (no restart needed)")
+        return True, "; ".join(parts)
+
+    if not allow_restart:
+        parts.append(
+            "plasmashell restart skipped (safe mode) — "
+            "mode saved; if the panel look did not change, use "
+            "systemctl --user restart plasma-plasmashell.service once"
+        )
         return True, "; ".join(parts)
 
     ok, restart_msg = restart_plasmashell(quit_timeout_s=restart_timeout_s)
@@ -1521,20 +1559,24 @@ def notify_kde_palette_change(
     *,
     timeout: float = 2.0,
     choices: SchemeApplyChoices | None = None,
+    aggressive_shell_refresh: bool = False,
 ) -> tuple[bool, str]:
     """
-    Ask KWin, PlasmaShell, and the accent-color service to pick up ``kdeglobals``.
+    Ask Qt/Plasma to pick up the newly written ``kdeglobals`` / color scheme.
 
-    ``org.kde.KGlobalSettings`` is not an activatable session service on
-    Plasma 6 (Wayland).  We instead:
+    Safe default (``aggressive_shell_refresh=False``):
+      * ``plasma-apply-colorscheme`` (Qt apps / Breeze)
+      * ``KWin.reconfigure``
+      * ``plasmashell.accentColor.setAccentColor``
 
-    * ``org.kde.KWin`` → ``reconfigure()`` (window chrome / compositor hints)
-    * ``org.kde.plasmashell`` → ``refreshCurrentShell()`` (lightweight shell refresh)
-    * ``org.kde.plasmashell.accentColor`` → ``setAccentColor(u)`` — this updates
-      the **global Plasma accent** used by the panel, kickoff, and many shell
-      widgets (see ``kded6`` module ``plasma_accentcolor_service``).
+    Explicitly **skipped** by default because they have exited plasmashell
+    cleanly on Plasma 6 (``--no-respawn``) on this machine:
+      * ``plasma-apply-desktoptheme``
+      * ``PlasmaShell.refreshCurrentShell``
+      * plasmarc theme toggle reload
 
-    The ``timeout`` parameter is kept for API compatibility; it is unused.
+    Pass ``aggressive_shell_refresh=True`` only when the user opts into a full
+    shell refresh (and preferably with ``restart_plasma_after_apply``).
     """
     del timeout  # API compat; calls are synchronous and expected to be fast
     ch = normalize_scheme_apply_choices(choices)
@@ -1545,14 +1587,17 @@ def notify_kde_palette_change(
     parts.append(cs_msg)
     ok_any = ok_any or cs_ok
 
-    live_ok, live_msg = apply_plasma_desktop_theme_live()
-    parts.append(live_msg)
-    if live_ok:
-        ok_any = True
+    if aggressive_shell_refresh:
+        live_ok, live_msg = apply_plasma_desktop_theme_live()
+        parts.append(live_msg)
+        if live_ok:
+            ok_any = True
+        else:
+            tr_ok, tr_msg = toggle_reload_plasma_desktop_theme()
+            parts.append(tr_msg)
+            ok_any = ok_any or tr_ok
     else:
-        tr_ok, tr_msg = toggle_reload_plasma_desktop_theme()
-        parts.append(tr_msg)
-        ok_any = ok_any or tr_ok
+        parts.append("plasma-apply-desktoptheme skipped (safe mode)")
 
     try:
         import dbus  # type: ignore
@@ -1570,88 +1615,124 @@ def notify_kde_palette_change(
     except Exception as exc:  # noqa: BLE001
         parts.append(f"KWin.reconfigure: {exc}")
 
-    try:
-        shell = bus.get_object("org.kde.plasmashell", "/PlasmaShell")
-        dbus.Interface(shell, "org.kde.PlasmaShell").refreshCurrentShell()
-        parts.append("PlasmaShell.refreshCurrentShell OK")
-        ok_any = True
-    except Exception as exc:  # noqa: BLE001
-        parts.append(f"PlasmaShell.refreshCurrentShell: {exc}")
+    if aggressive_shell_refresh and plasmashell_dbus_ready():
+        try:
+            shell = bus.get_object("org.kde.plasmashell", "/PlasmaShell")
+            dbus.Interface(shell, "org.kde.PlasmaShell").refreshCurrentShell()
+            parts.append("PlasmaShell.refreshCurrentShell OK")
+            ok_any = True
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"PlasmaShell.refreshCurrentShell: {exc}")
+    else:
+        parts.append("PlasmaShell.refreshCurrentShell skipped (safe mode)")
 
-    try:
-        argb = rgb_tuple_to_argb_u(pal.colors[ch.accent])
-        ac = bus.get_object("org.kde.plasmashell.accentColor", "/AccentColor")
-        dbus.Interface(ac, "org.kde.plasmashell.accentColor").setAccentColor(dbus.UInt32(argb))
-        parts.append("plasmashell.accentColor.setAccentColor OK")
-        ok_any = True
-    except Exception as exc:  # noqa: BLE001
-        parts.append(f"plasmashell.accentColor.setAccentColor: {exc}")
+    if plasmashell_dbus_ready():
+        try:
+            argb = rgb_tuple_to_argb_u(pal.colors[ch.accent])
+            ac = bus.get_object("org.kde.plasmashell.accentColor", "/AccentColor")
+            dbus.Interface(ac, "org.kde.plasmashell.accentColor").setAccentColor(dbus.UInt32(argb))
+            parts.append("plasmashell.accentColor.setAccentColor OK")
+            ok_any = True
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"plasmashell.accentColor.setAccentColor: {exc}")
+    else:
+        parts.append("accentColor skipped (plasmashell not ready)")
 
     return ok_any, "; ".join(parts)
+
+
+def plasmashell_process_running() -> bool:
+    try:
+        check = subprocess.run(
+            ["pgrep", "-x", "plasmashell"],
+            check=False,
+            capture_output=True,
+            timeout=2,
+        )
+        return check.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def plasmashell_dbus_ready() -> bool:
+    """True when ``org.kde.plasmashell`` answers on the session bus."""
+    try:
+        import dbus  # type: ignore
+
+        bus = dbus.SessionBus()
+        names = [str(n) for n in (bus.list_names() or [])]
+        if "org.kde.plasmashell" not in names:
+            return False
+        bus.get_object("org.kde.plasmashell", "/PlasmaShell")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wait_for_plasmashell(*, timeout_s: float) -> bool:
+    deadline = time.monotonic() + max(1.0, timeout_s)
+    while time.monotonic() < deadline:
+        if plasmashell_process_running() and plasmashell_dbus_ready():
+            return True
+        time.sleep(0.25)
+    return plasmashell_process_running() and plasmashell_dbus_ready()
 
 
 def restart_plasmashell(*, quit_timeout_s: float = 25.0) -> tuple[bool, str]:
     """
     Fully restart ``plasmashell`` so panel and launcher pick up every color role.
 
-    ``refreshCurrentShell`` and accent updates help, but parts of the desktop
-    shell still cache QPalette / theme data until the process restarts.  This
-    matches what many KDE docs suggest when ``kdeglobals`` is edited by hand.
-
-    Uses ``kquitapp6 plasmashell`` (or ``kquitapp5``) then ``kstart plasmashell``.
-    There is a short desktop flicker while the shell comes back.
+    Prefer ``systemctl --user restart plasma-plasmashell.service``. Plasma 6
+    starts the shell with ``--no-respawn`` under that unit; ``kquitapp`` +
+    ``kstart`` fights systemd and has left the desktop dead when the new
+    process never registered on DBus.
     """
-    kquit = shutil.which("kquitapp6") or shutil.which("kquitapp5")
-    kstart = shutil.which("kstart")
-    if not kquit:
-        return False, "Neither kquitapp6 nor kquitapp5 was found in PATH."
-    if not kstart:
-        return False, "kstart was not found in PATH."
-
-    try:
-        proc = subprocess.run(
-            [kquit, "plasmashell"],
-            capture_output=True,
-            text=True,
-            timeout=quit_timeout_s,
-        )
-        err_tail = (proc.stderr or proc.stdout or "").strip()
-        if proc.returncode not in (0, 1):
-            # 1 can mean "not running" on some setups; still try kstart
-            if err_tail:
-                parts = f"kquitapp returned {proc.returncode}: {err_tail[:200]}"
-            else:
-                parts = f"kquitapp returned {proc.returncode}"
-        else:
-            parts = "kquitapp plasmashell OK"
-    except subprocess.TimeoutExpired:
-        return False, f"{kquit} plasmashell timed out after {quit_timeout_s:.0f}s."
-
-    subprocess.Popen(
-        [kstart, "plasmashell"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    # Verify the shell actually came back — a silent failure left the desktop
-    # dead while callers assumed the restart succeeded.
-    deadline = time.monotonic() + min(12.0, max(4.0, quit_timeout_s * 0.4))
-    while time.monotonic() < deadline:
+    wait_s = min(15.0, max(5.0, quit_timeout_s * 0.5))
+    systemctl = shutil.which("systemctl")
+    if systemctl:
         try:
-            check = subprocess.run(
-                ["pgrep", "-x", "plasmashell"],
-                check=False,
+            proc = subprocess.run(
+                [systemctl, "--user", "restart", "plasma-plasmashell.service"],
                 capture_output=True,
-                timeout=2,
+                text=True,
+                timeout=quit_timeout_s,
             )
-        except (OSError, subprocess.SubprocessError):
-            break
-        if check.returncode == 0:
-            return True, f"{parts}; started plasmashell via {kstart}."
-        time.sleep(0.25)
+        except subprocess.TimeoutExpired:
+            return False, f"systemctl restart plasma-plasmashell timed out after {quit_timeout_s:.0f}s"
+        except OSError as exc:
+            return False, f"systemctl restart plasma-plasmashell: {exc}"
+        if proc.returncode == 0 and _wait_for_plasmashell(timeout_s=wait_s):
+            return True, "systemctl --user restart plasma-plasmashell.service OK"
+        err = (proc.stderr or proc.stdout or "").strip()
+        unit_note = (
+            f"systemctl restart returned {proc.returncode}"
+            + (f": {err[:160]}" if err else "")
+            + "; dbus_ready="
+            + str(plasmashell_dbus_ready())
+        )
+        # Prefer start (not kquit) if restart left the unit stopped.
+        try:
+            subprocess.run(
+                [systemctl, "--user", "start", "plasma-plasmashell.service"],
+                capture_output=True,
+                text=True,
+                timeout=quit_timeout_s,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if _wait_for_plasmashell(timeout_s=wait_s):
+            return True, f"{unit_note}; systemctl start recovered plasmashell"
+        return False, (
+            f"{unit_note}; plasmashell did not become ready — "
+            "run: systemctl --user start plasma-plasmashell.service"
+            "  or: plasmacolorizer-recover"
+        )
+
     return False, (
-        f"{parts}; kstart launched but plasmashell did not reappear — "
-        "run: kstart plasmashell   or: python -m plasmacolorizer.conky.recover"
+        "systemctl not in PATH; refusing kquitapp plasmashell fallback "
+        "(has left Plasma dead with --no-respawn). "
+        "Install systemd user session tools or start plasmashell manually."
     )
 
 
